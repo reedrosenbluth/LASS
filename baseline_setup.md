@@ -6,12 +6,12 @@ ssh <NetId>@log-1.hpc.nyu.edu
 ```
 
 ### setup git and clone repo
-- follow [github's instructions](https://docs.github.com/en/authentication/connecting-to-github-with-ssh/adding-a-new-ssh-key-to-your-github-account#about-addition-of-ssh-keys-to-your-account) to create a new ssh key for your HPC user, add it to your github account, and clone the repo to your scratch directory. Make sure to select the `linux` option at the top of the pages!
-  - after completing this run:
-    ```bash
-    cd /scratch/$USER/
-    git clone git@github.com:reedrosenbluth/LASS.git
-    ```
+follow [github's instructions](https://docs.github.com/en/authentication/connecting-to-github-with-ssh/adding-a-new-ssh-key-to-your-github-account#about-addition-of-ssh-keys-to-your-account) to create a new ssh key for your HPC user, add it to your github account, and clone the repo to your scratch directory. Make sure to select the `linux` option at the top of the pages!
+- after completing this run:
+```bash
+cd /scratch/$USER/
+git clone git@github.com:reedrosenbluth/LASS.git
+```
 
 *Alternatively*, you can follow Julia's instructions to transfer your local repo via SCP and set it as a git remote. I think this option is messier and much more cumbersome!
 
