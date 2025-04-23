@@ -1,14 +1,14 @@
 ## Setting up the Baseline model for training on HPC
 
 ### `ssh` into HPC cluster:
-```
+```bash
 ssh <NetId>@log-1.hpc.nyu.edu
 ```
 
 ### setup git and clone repo
 - follow [github's instructions](https://docs.github.com/en/authentication/connecting-to-github-with-ssh/adding-a-new-ssh-key-to-your-github-account#about-addition-of-ssh-keys-to-your-account) to create a new ssh key for your HPC user, add it to your github account, and clone the repo to your scratch directory. Make sure to select the `linux` option at the top of the pages!
   - after completing this run:
-    ```
+    ```bash
     cd /scratch/$USER/
     git clone git@github.com:reedrosenbluth/LASS.git
     ```
@@ -19,7 +19,7 @@ ssh <NetId>@log-1.hpc.nyu.edu
   - setup the directory as a git remote for your local repo (so you can pull changes back to your local machine) by following [Julia's instructions](https://github.com/juliawilkins/nyu-csgy9223-ML25/blob/main/HPC_tips.md)
 
 ### install singuconda
-  ```
+  ```bash
   cd /scratch/$USER/
 
   curl -L https://github.com/beasteers/singuconda/raw/main/singuconda --output /scratch/$USER/singuconda
@@ -32,7 +32,7 @@ ssh <NetId>@log-1.hpc.nyu.edu
   - make sure to select `overlay-50G-10M`, CUDA GPU, and Python 3.10.9
 
 ### create the conda environment
-  ```
+  ```bash
   cd /scratch/$USER
 
   # activate the singularity container in read/write mode
@@ -47,7 +47,7 @@ ssh <NetId>@log-1.hpc.nyu.edu
   conda activate AudioSep
   ```
 ### download the datasets and captions
-  ```
+  ```bash
   cd /scratch/$USER/
 
   # activate singularity if not already active
@@ -75,7 +75,7 @@ ssh <NetId>@log-1.hpc.nyu.edu
 
   ```
 ### unzip the datasets
-  ```
+  ```bash
   cd /scratch/$USER/clotho_dataset
 
   pip requests py7zr
@@ -111,7 +111,7 @@ ssh <NetId>@log-1.hpc.nyu.edu
   rm *.zip *.z[0-9]*
   ```
 ### download the model checkpoints
-  ```
+  ```bash
   # download CLAP model weights and move into AudioSep repo
   wget https://huggingface.co/spaces/Audio-AGI/AudioSep/resolve/main/checkpoint/music_speech_audioset_epoch_15_esc_89.98.pt?download=true
   mkdir /scratch/$USER/LASS/checkpoint
