@@ -63,6 +63,9 @@ mkdir -p /scratch/$USER/clotho_dataset
 mkdir -p /scratch/$USER/fsd50k_dataset
 mkdir -p /scratch/$USER/fsd50k_captions
 
+# connect to the Greene data transfer node for faster downloads
+ssh gdtn
+
 # download clotho
 cd /scratch/$USER/clotho_dataset
 zenodo_get 10.5281/zenodo.4783391
@@ -74,7 +77,6 @@ zenodo_get 10.5281/zenodo.4060432
 # download fsd50k captions
 cd /scratch/$USER/fsd50k_captions
 zenodo_get 10.5281/zenodo.10887496
-
 ```
 
 ### unzip the datasets
@@ -123,6 +125,9 @@ wget -O /scratch/$USER/LASS/checkpoint/music_speech_audioset_epoch_15_esc_89.98.
 # download baseline model checkpoint
 cd /scratch/$USER/
 zenodo_get 10.5281/zenodo.10887459
+
+# exit the data transfer node
+exit
 ```
 
 ### convert data to 16kHz mono
