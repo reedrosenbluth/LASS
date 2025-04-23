@@ -134,7 +134,10 @@ exit
 
 install `sox`
 ```bash
-# make sure you're in your singularity container
+# activate the singularity container in read/write mode
+cd /scratch/$USER
+./singrw
+
 conda install -c conda-forge sox
 
 ```
