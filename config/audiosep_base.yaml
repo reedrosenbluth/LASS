@@ -1,9 +1,16 @@
 ---
 task_name: AudioSep
 
+clotho_development.json  clotho_validation.json  fsd50k_eval.json
+clotho_evaluation.json	 fsd50k_dev.json	 template.json
+
 data:
     datafiles:
-        - 'datafiles/template.json'
+        - 'datafiles/clotho_development.json'
+        - 'datafiles/clotho_validation.json'
+        - 'datafiles/clotho_evaluation.json'
+        - 'datafiles/fsd50k_dev.json'
+        - 'datafiles/fsd50k_eval.json'
 
     sampling_rate: 16000
     segment_seconds: 10
