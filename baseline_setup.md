@@ -24,6 +24,7 @@ cd /scratch/$USER/
 
 curl -L https://github.com/beasteers/singuconda/raw/main/singuconda --output /scratch/$USER/singuconda
 
+# give executable permission to the script
 chmod +x ~/singuconda
 
 # run the script 
@@ -137,6 +138,7 @@ run `process_audio.sh` script. this will create a `processed_data_files` directo
 ```bash
 cd /scratch/$USER/LASS/scripts
 
+# give executable permissions to the script
 chmod +x process_audio.sh
 
 # this will take a little while. run in tmux if you want to close your laptop and return later
