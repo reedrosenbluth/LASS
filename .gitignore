@@ -1,2 +1,7 @@
 /checkpoint
 /processed_data_files
+lightning_logs/
+workspace/
+__pycache__/
+*.py[cod]
+*$py.class

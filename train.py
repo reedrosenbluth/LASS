@@ -5,6 +5,7 @@ import pathlib
 from typing import List, NoReturn
 import lightning.pytorch as pl
 from lightning.pytorch.strategies import DDPStrategy
+from lightning.pytorch.loggers import WandbLogger
 from torch.utils.tensorboard import SummaryWriter
 from data.datamodules import *
 from utils import create_logging, parse_yaml
@@ -15,6 +16,7 @@ from data.waveform_mixers import SegmentMixer
 from models.clap_encoder import CLAP_Encoder
 from callbacks.base import CheckpointEveryNSteps
 from optimizers.lr_schedulers import get_lr_lambda
+import wandb
 
 
 def get_dirs(
@@ -249,6 +251,16 @@ def train(args) -> NoReturn:
 
     summary_writer = SummaryWriter(log_dir=tf_logs_dir)
 
+    yaml_name = pathlib.Path(config_yaml).stem
+
+    wandb_logger = WandbLogger(
+        project="LASS",
+        name=f"{yaml_name}_devices{devices_num}",
+        save_dir=tf_logs_dir,
+        log_model=True,
+        config=configs,
+    )
+
     callbacks = [checkpoint_every_n_steps]
 
     trainer = pl.Trainer(
@@ -257,7 +269,7 @@ def train(args) -> NoReturn:
         strategy='ddp_find_unused_parameters_true',
         num_nodes=num_nodes,
         precision="32-true",
-        logger=None,
+        logger=wandb_logger,
         callbacks=callbacks,
         fast_dev_run=False,
         max_epochs=-1,
@@ -278,6 +290,8 @@ def train(args) -> NoReturn:
         datamodule=data_module,
         ckpt_path=resume_checkpoint_path,
     )
+
+    wandb.finish()
 
 
 if __name__ == "__main__":
