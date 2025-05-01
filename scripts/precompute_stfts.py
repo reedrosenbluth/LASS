@@ -1,6 +1,5 @@
 import torch
 import torchaudio
-import torchaudio.functional as F
 import numpy as np
 import argparse
 import os
@@ -14,24 +13,31 @@ from data.audiotext_dataset import AudioTextDataset
 from data.waveform_mixers import SegmentMixer
 
 def calculate_stft_components(waveform, n_fft, hop_length, win_length, window, center, pad_mode):
-    """Calculates STFT magnitude, cosine, and sine components."""
-    # waveform shape: (batch, channels, time) -> needs (channels, time) or (time,) for stft
-    # Let's assume mono audio for now, matching AudioTextDataset output: (batch, 1, time) -> (batch, time)
+    """Calculates STFT magnitude, cosine, and sine components using Spectrogram transform."""
+    # waveform shape: (batch, channels, time) -> needs (batch, time) for Spectrogram
     waveform = waveform.squeeze(1) 
     
     window_fn = getattr(torch, f"{window}_window")
 
-    # Returns: (..., freq, time, 2) for real/imaginary or (..., freq, time) for magnitude
-    stft_complex = F.stft(
-        waveform,
+    # Instantiate the Spectrogram transform
+    spectrogram_transform = torchaudio.transforms.Spectrogram(
         n_fft=n_fft,
         hop_length=hop_length,
         win_length=win_length,
-        window=window_fn(win_length, device=waveform.device),
+        window_fn=window_fn, # Note: pass the function itself
         center=center,
         pad_mode=pad_mode,
-        return_complex=True,
-    ) # Shape: (batch, freq, time_steps)
+        power=None, # Get complex output
+        normalized=False, # Or True, depending on model needs? Matching old behavior.
+    ).to(waveform.device)
+
+    # Apply the transform
+    stft_complex = spectrogram_transform(waveform) # Shape: (batch, freq, time_steps)
+    
+    # If using older torchaudio that doesn't directly return complex from Spectrogram:
+    # Check if output is real/imag interleaved (..., 2) 
+    # if stft_complex.shape[-1] == 2 and not torch.is_complex(stft_complex):
+    #     stft_complex = torch.view_as_complex(stft_complex)
 
     magnitude = torch.abs(stft_complex)
     phase = torch.angle(stft_complex)
