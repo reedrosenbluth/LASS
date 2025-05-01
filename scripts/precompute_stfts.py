@@ -1,18 +1,14 @@
 import torch
-import torchaudio
 import numpy as np
 import argparse
-import os
-import json
+import yaml
 from tqdm import tqdm
 import pathlib
 from torch.utils.data import DataLoader
+from torchlibrosa.stft import STFT, magphase
 
-# Assuming these imports are correct based on the project structure
 from data.audiotext_dataset import AudioTextDataset
 from data.waveform_mixers import SegmentMixer
-# Import STFT and magphase from torchlibrosa
-from torchlibrosa.stft import STFT, magphase
 
 def calculate_stft_components(waveform, n_fft, hop_length, win_length, window, center, pad_mode):
     """Calculates STFT magnitude, cosine, and sine components using torchlibrosa.STFT."""
@@ -56,33 +52,46 @@ def save_precomputed_data(output_dir, index, data_dict):
 
 
 def main(args):
+    print("Loading config file...")
+    with open(args.config_yaml, 'r') as f:
+        configs = yaml.safe_load(f)
+
+    # Extract parameters from config
+    sampling_rate = configs['data']['sampling_rate']
+    max_clip_len = configs['data']['segment_seconds'] # Use segment_seconds
+    max_mix_num = configs['data']['max_mix_num']
+    lower_db = configs['data']['loudness_norm']['lower_db']
+    higher_db = configs['data']['loudness_norm']['higher_db']
+    batch_size = configs['train']['batch_size_per_device']
+    num_workers = configs['train']['num_workers']
+
     print("Initializing dataset...")
     dataset = AudioTextDataset(
         datafiles=args.data_files,
-        sampling_rate=args.sampling_rate,
-        max_clip_len=args.max_clip_len,
+        sampling_rate=sampling_rate, # Use value from config
+        max_clip_len=max_clip_len,     # Use value from config
     )
     print(f"Dataset size: {len(dataset)}")
 
     # Need batch_size >= max_mix_num for SegmentMixer
-    batch_size = args.batch_size
-    if batch_size < args.max_mix_num:
-        print(f"Warning: batch_size ({batch_size}) < max_mix_num ({args.max_mix_num}). Adjusting batch_size.")
-        batch_size = args.max_mix_num
+    # Use batch_size from config
+    if batch_size < max_mix_num:
+        print(f"Warning: batch_size ({batch_size}) < max_mix_num ({max_mix_num}). Adjusting batch_size.")
+        batch_size = max_mix_num
 
     dataloader = DataLoader(
         dataset,
-        batch_size=batch_size,
+        batch_size=batch_size, # Use value from config (potentially adjusted)
         shuffle=False, # Keep order for saving with index
-        num_workers=args.num_workers,
+        num_workers=num_workers, # Use value from config
         collate_fn=None # Use default collate
     )
 
     print("Initializing mixer...")
     segment_mixer = SegmentMixer(
-        max_mix_num=args.max_mix_num,
-        lower_db=args.lower_db,
-        higher_db=args.higher_db,
+        max_mix_num=max_mix_num, # Use value from config
+        lower_db=lower_db,     # Use value from config
+        higher_db=higher_db,   # Use value from config
     )
     segment_mixer.eval() # Set to eval mode if it has dropout/batchnorm
 
@@ -149,27 +158,17 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Precompute STFTs for audio data.")
 
-    # --- Dataset Arguments ---
-    parser.add_argument('--data_files', type=str, required=True, nargs='+',
-                        help='Path(s) to the input dataset JSON file(s).')
-    parser.add_argument('--sampling_rate', type=int, default=32000,
-                        help='Target audio sampling rate.')
-    parser.add_argument('--max_clip_len', type=int, default=5,
-                        help='Maximum audio clip length in seconds.')
+    # --- Config File Argument ---
+    parser.add_argument('--config_yaml', type=str, required=True,
+                        help='Path to the base configuration YAML file.')
 
-    # --- Output Arguments ---
+    # --- Dataset/Output Arguments ---
+    parser.add_argument('--data_files', type=str, required=True, nargs='+',
+                        help='Path(s) to the input dataset JSON file(s) (overrides config if specified).')
     parser.add_argument('--output_dir', type=str, required=True,
                         help='Directory to save precomputed STFT files.')
 
-    # --- Mixer Arguments ---
-    parser.add_argument('--max_mix_num', type=int, default=4, # Example default
-                        help='Maximum number of segments to mix (including original).')
-    parser.add_argument('--lower_db', type=int, default=-5, # Example default
-                        help='Lower bound for loudness normalization (dB).')
-    parser.add_argument('--higher_db', type=int, default=5, # Example default
-                        help='Higher bound for loudness normalization (dB).')
-
-    # --- STFT Arguments ---
+    # --- STFT Arguments (Keep defaults matching model) ---
     parser.add_argument('--n_fft', type=int, default=1024, help='STFT FFT size.')
     parser.add_argument('--hop_length', type=int, default=160, help='STFT hop length.')
     parser.add_argument('--win_length', type=int, default=1024, help='STFT window length.')
@@ -177,11 +176,16 @@ if __name__ == "__main__":
     parser.add_argument('--center', type=bool, default=True, help='STFT center.')
     parser.add_argument('--pad_mode', type=str, default='reflect', help='STFT padding mode.')
 
-    # --- Processing Arguments ---
-    parser.add_argument('--batch_size', type=int, default=16, # Should be >= max_mix_num
-                        help='Batch size for processing.')
-    parser.add_argument('--num_workers', type=int, default=4,
-                        help='Number of workers for DataLoader.')
-
     args = parser.parse_args()
+
+    # Allow overriding data_files from command line if provided
+    # If not provided via command line, attempt to read from config
+    if not args.data_files:
+        with open(args.config_yaml, 'r') as f:
+            configs = yaml.safe_load(f)
+        if 'data' in configs and 'datafiles' in configs['data']:
+            args.data_files = configs['data']['datafiles']
+        else:
+            raise ValueError("data_files must be provided either via command line or in the config YAML.")
+            
     main(args) 
