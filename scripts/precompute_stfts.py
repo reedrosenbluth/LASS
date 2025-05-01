@@ -551,7 +551,7 @@ def process_files_for_stfts(data_files, target_output_dir, recipe_file, configs,
     return processed_count_for_set
 
 
-def main(args):
+def main(args, parser):
     """
     Main function to either generate mixture recipes or compute STFTs based on recipes.
     """
@@ -575,15 +575,42 @@ def main(args):
     }
     # -------------------------------------------------------------------
 
-    # --- Setup Output Dirs ---
-    base_output_dir = pathlib.Path(args.output_dir)
-    train_output_dir = base_output_dir / "train"
-    val_output_dir = base_output_dir / "val"
-    # Directories are created inside process_files
-    print(f"Base output directory: {base_output_dir}")
-    print(f"Training output directory: {train_output_dir}")
-    print(f"Validation output directory: {val_output_dir}")
-    # ------------------------
+    # --- Load data file paths ---
+    # Check command line args first, then fall back to config
+    train_files_source = "command line"
+    val_files_source = "command line"
+
+    if args.train_data_files is None:
+        print("Training data files not provided via command line, attempting to read from config YAML...")
+        if 'data' in configs and 'train_datafiles' in configs['data']:
+            args.train_data_files = configs['data']['train_datafiles']
+            train_files_source = "config"
+            print(f"Using training data files from config: {args.train_data_files}")
+        else:
+            parser.error("train_data_files must be provided either via command line or in the config YAML under data.train_datafiles.")
+
+    if args.val_data_files is None:
+        print("Validation data files not provided via command line, attempting to read from config YAML...")
+        if 'data' in configs and 'val_datafiles' in configs['data']:
+            args.val_data_files = configs['data']['val_datafiles']
+            val_files_source = "config"
+            print(f"Using validation data files from config: {args.val_data_files}")
+        else:
+            parser.error("val_data_files must be provided either via command line or in the config YAML under data.val_datafiles.")
+
+    # Report final file sources if they came from command line
+    if train_files_source == "command line":
+        print(f"Using training data files provided via command line: {args.train_data_files}")
+    if val_files_source == "command line":
+        print(f"Using validation data files provided via command line: {args.val_data_files}")
+
+    # Ensure lists are not empty after loading
+    if not args.train_data_files:
+        parser.error("Training data file list cannot be empty (check command line or config).")
+    if not args.val_data_files:
+        parser.error("Validation data file list cannot be empty (check command line or config).")
+    # --- End Loading Data File Paths ---
+
 
     if args.mode == 'generate_recipes':
         if not args.output_recipe_dir:
@@ -618,33 +645,48 @@ def main(args):
         print(f"Total validation items processed: {total_val_processed}")
 
     elif args.mode == 'compute_stfts':
+        # --- Validate required arguments for this mode ---
         if not args.output_dir:
-             # Use parser error method if available
              parser.error("--output_dir is required for 'compute_stfts' mode.")
         if not args.input_recipe_dir:
-             # Use parser error method if available
              parser.error("--input_recipe_dir is required for 'compute_stfts' mode.")
 
-        # --- Setup STFT Output Dirs ---
+        # --- Setup STFT Output Dirs (Moved INSIDE this block) ---
+        base_output_dir = pathlib.Path(args.output_dir)
+        train_output_dir = base_output_dir / "train"
+        val_output_dir = base_output_dir / "val"
+        print(f"STFT output directory: {base_output_dir}")
+        print(f"Training STFT output directory: {train_output_dir}")
+        print(f"Validation STFT output directory: {val_output_dir}")
+        # -----------------------------------------------------
+
+        # --- Setup Recipe Input Paths ---
         base_recipe_dir = pathlib.Path(args.input_recipe_dir)
         train_recipe_file = base_recipe_dir / "train_mixture_recipes.json"
         val_recipe_file = base_recipe_dir / "val_mixture_recipes.json"
         print(f"Recipe input directory: {base_recipe_dir}")
 
         # --- Extract STFT common parameters for saving ---
-        stft_hop_length = configs['data']['stft_hop_length']
-        stft_window = configs['data']['stft_window']
-        stft_center = configs['data']['stft_center']
-        stft_pad_mode = configs['data']['stft_pad_mode']
-        stft_win_lengths = configs['data']['stft_win_lengths']
-        # -------------------------------------------------------------------
+        # Ensure 'data' key exists before accessing subkeys
+        if 'data' not in configs:
+             parser.error("Missing 'data' section in config YAML required for STFT parameters.")
 
-        # --- Setup Output Dirs ---
-        train_output_dir = base_output_dir / "train"
-        val_output_dir = base_output_dir / "val"
-        print(f"Training output directory: {train_output_dir}")
-        print(f"Validation output directory: {val_output_dir}")
-        # ------------------------
+        try:
+            stft_hop_length = configs['data']['stft_hop_length']
+            stft_window = configs['data']['stft_window']
+            stft_center = configs['data']['stft_center']
+            stft_pad_mode = configs['data']['stft_pad_mode']
+            stft_win_lengths = configs['data']['stft_win_lengths'] # Needed here too
+        except KeyError as e:
+             parser.error(f"Missing required STFT parameter in config YAML under 'data': {e}")
+
+        common_stft_params_for_saving = {
+            'hop_length': stft_hop_length,
+            'window': stft_window,
+            'center': stft_center,
+            'pad_mode': stft_pad_mode,
+        }
+        # -------------------------------------------------------------------
 
         # --- Process Training Files ---
         print("\n--- Processing Training Set STFTs ---")
@@ -676,6 +718,10 @@ def main(args):
         # Raise error if mode not recognized
         parser.error("Invalid mode selected. Choose 'generate_recipes' or 'compute_stfts'.")
 
+    # Argument validation now happens inside main() or via parser.error calls.
+
+    main(args, parser) # Pass parser to main
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Precompute STFTs or generate mixture recipes based on YAML config.")
@@ -702,23 +748,6 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    # Load data file paths from config if not provided (logic moved inside main)
-    main(args) # Pass parser to main if needed for error reporting
+    # Argument validation now happens inside main() or via parser.error calls.
 
-    # Report final file sources
-    if args.train_data_files is None:
-        print("Using training data files provided via command line: None")
-    else:
-        print(f"Using training data files provided via command line: {args.train_data_files}")
-    if args.val_data_files is None:
-        print("Using validation data files provided via command line: None")
-    else:
-        print(f"Using validation data files provided via command line: {args.val_data_files}")
-
-    # Ensure lists are not empty
-    if not args.train_data_files:
-         raise ValueError("Training data file list cannot be empty.")
-    if not args.val_data_files:
-         raise ValueError("Validation data file list cannot be empty.")
-
-    main(args) 
+    main(args, parser) # Pass parser to main 
