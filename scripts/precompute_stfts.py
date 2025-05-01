@@ -100,107 +100,89 @@ def save_precomputed_data(output_dir, index, data_dict):
     torch.save(cpu_data_dict, filename)
 
 
-def main(args):
+def process_files(data_files, target_output_dir, configs, common_stft_params_for_saving):
     """
-    Main function to load data, compute multiple STFTs per sample based on
-    config, and save the results.
+    Processes a list of data files: loads data, computes STFTs, and saves results.
     """
-    print("Loading config file...")
-    with open(args.config_yaml, 'r') as f:
-        configs = yaml.safe_load(f)
+    print(f"Processing files for output directory: {target_output_dir}")
+    target_output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Extract parameters from config
+    # --- Extract parameters from config (needed for dataset/dataloader/mixer) ---
     sampling_rate = configs['data']['sampling_rate']
-    max_clip_len = configs['data']['segment_seconds'] # Use segment_seconds
+    max_clip_len = configs['data']['segment_seconds']
     max_mix_num = configs['data']['max_mix_num']
     lower_db = configs['data']['loudness_norm']['lower_db']
     higher_db = configs['data']['loudness_norm']['higher_db']
     batch_size = configs['train']['batch_size_per_device']
     num_workers = configs['train']['num_workers']
 
-    # Extract STFT common parameters from config
+    # STFT params (needed for computation loop)
     stft_hop_length = configs['data']['stft_hop_length']
     stft_window = configs['data']['stft_window']
     stft_center = configs['data']['stft_center']
     stft_pad_mode = configs['data']['stft_pad_mode']
-    stft_win_lengths = configs['data']['stft_win_lengths'] # List of window lengths
-
-    # Store common params for saving later
-    common_stft_params_for_saving = {
-        'hop_length': stft_hop_length,
-        'window': stft_window,
-        'center': stft_center,
-        'pad_mode': stft_pad_mode,
-    }
+    stft_win_lengths = configs['data']['stft_win_lengths']
+    # --- End Parameter Extraction ---
 
     print("Initializing dataset...")
-    # Use data_files from command line args (which might have been populated from config)
     dataset = AudioTextDataset(
-        datafiles=args.data_files,
-        sampling_rate=sampling_rate, # Use value from config
-        max_clip_len=max_clip_len,     # Use value from config
+        datafiles=data_files, # Use the specific list passed to this function
+        sampling_rate=sampling_rate,
+        max_clip_len=max_clip_len,
     )
-    print(f"Dataset size: {len(dataset)}")
+    print(f"Dataset size for this set: {len(dataset)}")
+
+    if not dataset:
+        print(f"Warning: No data found for files: {data_files}. Skipping processing for {target_output_dir}")
+        return 0 # Return 0 processed items
 
     # Need batch_size >= max_mix_num for SegmentMixer
-    # Use batch_size from config
     if batch_size < max_mix_num:
         print(f"Warning: batch_size ({batch_size}) < max_mix_num ({max_mix_num}). Adjusting batch_size.")
         batch_size = max_mix_num
 
     dataloader = DataLoader(
         dataset,
-        batch_size=batch_size, # Use value from config (potentially adjusted)
-        shuffle=False, # Keep order for saving with index
-        num_workers=num_workers, # Use value from config
+        batch_size=batch_size,
+        shuffle=False, # Keep order for saving with index within this set
+        num_workers=num_workers,
         collate_fn=None # Use default collate
     )
 
     print("Initializing mixer...")
     segment_mixer = SegmentMixer(
-        max_mix_num=max_mix_num, # Use value from config
-        lower_db=lower_db,     # Use value from config
-        higher_db=higher_db,   # Use value from config
+        max_mix_num=max_mix_num,
+        lower_db=lower_db,
+        higher_db=higher_db,
     )
-    segment_mixer.eval() # Set to eval mode if it has dropout/batchnorm
+    segment_mixer.eval()
 
     # --- Device Selection ---
+    # Consider making device selection happen only once in main?
+    # For now, keep it here for encapsulation.
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
-    segment_mixer.to(device) # Move mixer to the selected device
+    segment_mixer.to(device)
     # -----------------------
 
-    print("Creating output directory...")
-    output_dir = pathlib.Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    print("Starting precomputation...")
-    processed_count = 0
-    global_index = 0 # Keep track of the absolute index across batches
-
-    # STFT parameters are now handled inside the loop
+    print("Starting precomputation loop...")
+    processed_count_for_set = 0
+    item_index_for_set = 0 # Keep track of the index *within this set*
 
     for batch in tqdm(dataloader):
         waveforms = batch['waveform'] # Shape: (batch, 1, time)
         texts = batch['text']       # List of strings
-        
-        # Ensure waveforms are on the correct device
+
         waveforms = waveforms.to(device)
-        # segment_mixer is already moved to the device
 
         with torch.no_grad():
-            # Mix waveforms (computation happens on the selected device)
-            mixtures, segments = segment_mixer(waveforms) # Output shapes: (batch, 1, time)
+            mixtures, segments = segment_mixer(waveforms)
 
-            # --- Compute Multiple STFTs --- 
-            # Temporary dicts to hold batch results before rearranging for saving
             batch_mixture_stfts = {win_len: None for win_len in stft_win_lengths}
             batch_segment_stfts = {win_len: None for win_len in stft_win_lengths}
 
             for win_length in stft_win_lengths:
-                n_fft = win_length # Set n_fft = win_length as decided
-                
-                # Define params for this specific STFT config
+                n_fft = win_length
                 current_stft_params = {
                     'n_fft': n_fft,
                     'hop_length': stft_hop_length,
@@ -210,51 +192,101 @@ def main(args):
                     'pad_mode': stft_pad_mode,
                 }
 
-                # Calculate STFT for mixtures 
                 mixture_mag, mixture_cos, mixture_sin = calculate_stft_components(
                     mixtures, **current_stft_params
                 )
-                # Store the tuple of tensors for the whole batch
                 batch_mixture_stfts[win_length] = (mixture_mag, mixture_cos, mixture_sin)
-                 
-                # Calculate STFT for segments
+
                 segment_mag, segment_cos, segment_sin = calculate_stft_components(
                     segments, **current_stft_params
                 )
-                # Store the tuple of tensors for the whole batch
                 batch_segment_stfts[win_length] = (segment_mag, segment_cos, segment_sin)
-            # --------------------------------
 
-        # --- Restructure and Save --- 
-        # Rearrange data from batch-major to item-major for saving
-        current_batch_size = waveforms.size(0) # Use actual batch size from this iteration
+        current_batch_size = waveforms.size(0)
         for i in range(current_batch_size):
-            # Check if we have processed more items than exist in the dataset
-            # This can happen if the last batch is smaller than the specified batch_size
-            if global_index < len(dataset):
-                 item_mixture_stfts = {}
-                 item_segment_stfts = {}
-                 for win_len in stft_win_lengths:
-                    # Extract the i-th item's STFT tuple for this win_len from the batch result
-                    item_mixture_stfts[win_len] = tuple(t[i] for t in batch_mixture_stfts[win_len]) 
-                    item_segment_stfts[win_len] = tuple(t[i] for t in batch_segment_stfts[win_len])
-                 
-                 data_to_save = {
-                     'stfts': {
-                         'mixture': item_mixture_stfts,
-                         'segment': item_segment_stfts
-                     },
-                     'text': texts[i],
-                     'stft_common_params': common_stft_params_for_saving,
-                     'stft_win_lengths': stft_win_lengths
-                 }
-                 # Save function handles moving tensors to CPU
-                 save_precomputed_data(output_dir, global_index, data_to_save)
-                 processed_count += 1
-            global_index += 1 # Increment index regardless of whether it was saved
+            # No need to check global index against dataset len anymore,
+            # DataLoader handles the last batch size correctly.
+            item_mixture_stfts = {}
+            item_segment_stfts = {}
+            for win_len in stft_win_lengths:
+                item_mixture_stfts[win_len] = tuple(t[i] for t in batch_mixture_stfts[win_len])
+                item_segment_stfts[win_len] = tuple(t[i] for t in batch_segment_stfts[win_len])
+
+            data_to_save = {
+                'stfts': {
+                    'mixture': item_mixture_stfts,
+                    'segment': item_segment_stfts
+                },
+                'text': texts[i],
+                'stft_common_params': common_stft_params_for_saving,
+                'stft_win_lengths': stft_win_lengths
+            }
+            save_precomputed_data(target_output_dir, item_index_for_set, data_to_save)
+            processed_count_for_set += 1
+            item_index_for_set += 1
+
+    print(f"Finished processing for {target_output_dir}. Precomputed {processed_count_for_set} items.")
+    return processed_count_for_set
 
 
-    print(f"Finished. Precomputed {processed_count} items.")
+def main(args):
+    """
+    Main function to load data, compute multiple STFTs per sample based on
+    config, and save the results for train and validation sets separately.
+    """
+    print("Loading config file...")
+    with open(args.config_yaml, 'r') as f:
+        configs = yaml.safe_load(f)
+
+    # --- Extract only STFT common parameters needed by both processes ---
+    # Other params (batch size, num workers, etc.) are read inside process_files
+    stft_hop_length = configs['data']['stft_hop_length']
+    stft_window = configs['data']['stft_window']
+    stft_center = configs['data']['stft_center']
+    stft_pad_mode = configs['data']['stft_pad_mode']
+    # stft_win_lengths = configs['data']['stft_win_lengths'] # Read inside helper
+
+    common_stft_params_for_saving = {
+        'hop_length': stft_hop_length,
+        'window': stft_window,
+        'center': stft_center,
+        'pad_mode': stft_pad_mode,
+    }
+    # -------------------------------------------------------------------
+
+    # --- Setup Output Dirs ---
+    base_output_dir = pathlib.Path(args.output_dir)
+    train_output_dir = base_output_dir / "train"
+    val_output_dir = base_output_dir / "val"
+    # Directories are created inside process_files
+    print(f"Base output directory: {base_output_dir}")
+    print(f"Training output directory: {train_output_dir}")
+    print(f"Validation output directory: {val_output_dir}")
+    # ------------------------
+
+    # --- Process Training Files ---
+    print("\n--- Processing Training Set ---")
+    total_train_processed = process_files(
+        data_files=args.train_data_files,
+        target_output_dir=train_output_dir,
+        configs=configs,
+        common_stft_params_for_saving=common_stft_params_for_saving
+    )
+    # ----------------------------
+
+    # --- Process Validation Files ---
+    print("\n--- Processing Validation Set ---")
+    total_val_processed = process_files(
+        data_files=args.val_data_files,
+        target_output_dir=val_output_dir,
+        configs=configs,
+        common_stft_params_for_saving=common_stft_params_for_saving
+    )
+    # ------------------------------
+
+    print(f"\nFinished all processing.")
+    print(f"Total training items processed: {total_train_processed}")
+    print(f"Total validation items processed: {total_val_processed}")
 
 
 if __name__ == "__main__":
@@ -265,27 +297,66 @@ if __name__ == "__main__":
                         help='Path to the base configuration YAML file.')
 
     # --- Dataset/Output Arguments ---
-    parser.add_argument('--data_files', type=str, default=None, nargs='+', # Default to None to read from YAML
-                        help='Path(s) to the input dataset JSON file(s) (overrides config if specified).')
+    parser.add_argument('--train_data_files', type=str, default=None, nargs='+',
+                        help='Path(s) to the training dataset JSON file(s) (overrides config if specified).')
+    parser.add_argument('--val_data_files', type=str, default=None, nargs='+',
+                        help='Path(s) to the validation dataset JSON file(s) (overrides config if specified).')
     parser.add_argument('--output_dir', type=str, required=True,
-                        help='Directory to save precomputed STFT files.')
+                        help='Directory to save precomputed STFT files (will create train/ and val/ subdirs).')
 
     args = parser.parse_args()
 
-    # Allow overriding data_files from command line if provided
-    # If not provided via command line, attempt to read from config
-    if args.data_files is None: # Check if it's None (the default)
-        print("Data files not provided via command line, attempting to read from YAML...")
-        with open(args.config_yaml, 'r') as f:
-            # Use a different variable name to avoid potential conflicts if main also reads config
-            configs_for_datafiles = yaml.safe_load(f) 
-        if 'data' in configs_for_datafiles and 'datafiles' in configs_for_datafiles['data']:
-            args.data_files = configs_for_datafiles['data']['datafiles']
-            print(f"Using data files from config: {args.data_files}")
-        else:
-            # Raise error if still no data files found
-            raise ValueError("data_files must be provided either via command line or in the config YAML under data.datafiles.")
-    else:
-        print(f"Using data files provided via command line: {args.data_files}")
+    # --- Load data file paths from config if not provided via command line ---
+    train_files_source = "command line"
+    val_files_source = "command line"
+
+    if args.train_data_files is None or args.val_data_files is None:
+        print("Train or validation data files not provided via command line, attempting to read from YAML...")
+        try:
+            with open(args.config_yaml, 'r') as f:
+                configs_for_datafiles = yaml.safe_load(f)
             
+            if args.train_data_files is None:
+                if 'data' in configs_for_datafiles and 'train_datafiles' in configs_for_datafiles['data']:
+                    args.train_data_files = configs_for_datafiles['data']['train_datafiles']
+                    train_files_source = "config"
+                    print(f"Using training data files from config: {args.train_data_files}")
+                else:
+                    raise ValueError("train_data_files must be provided either via command line or in the config YAML under data.train_datafiles.")
+            
+            if args.val_data_files is None:
+                 if 'data' in configs_for_datafiles and 'val_datafiles' in configs_for_datafiles['data']:
+                    args.val_data_files = configs_for_datafiles['data']['val_datafiles']
+                    val_files_source = "config"
+                    print(f"Using validation data files from config: {args.val_data_files}")
+                 else:
+                    # Allow validation set to be optional? For now, require it.
+                    raise ValueError("val_data_files must be provided either via command line or in the config YAML under data.val_datafiles.")
+        except FileNotFoundError:
+             print(f"Error: Config file not found at {args.config_yaml}")
+             # Re-raise the specific errors if files still weren't found after trying YAML
+             if args.train_data_files is None:
+                 raise ValueError("train_data_files must be provided via command line (config file not found).")
+             if args.val_data_files is None:
+                 raise ValueError("val_data_files must be provided via command line (config file not found).")
+        except yaml.YAMLError as e:
+            print(f"Error parsing YAML file {args.config_yaml}: {e}")
+            # Re-raise errors
+            if args.train_data_files is None:
+                 raise ValueError("train_data_files must be provided via command line (YAML parse error).")
+            if args.val_data_files is None:
+                 raise ValueError("val_data_files must be provided via command line (YAML parse error).")
+
+    # Report final file sources
+    if train_files_source == "command line":
+        print(f"Using training data files provided via command line: {args.train_data_files}")
+    if val_files_source == "command line":
+        print(f"Using validation data files provided via command line: {args.val_data_files}")
+
+    # Ensure lists are not empty
+    if not args.train_data_files:
+         raise ValueError("Training data file list cannot be empty.")
+    if not args.val_data_files:
+         raise ValueError("Validation data file list cannot be empty.")
+
     main(args) 
