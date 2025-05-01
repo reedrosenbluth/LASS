@@ -732,8 +732,6 @@ def main(args, parser):
 
     # Argument validation now happens inside main() or via parser.error calls.
 
-    main(args, parser) # Pass parser to main
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Precompute STFTs or generate mixture recipes based on YAML config.")
