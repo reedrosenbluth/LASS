@@ -56,9 +56,9 @@ def calculate_stft_components(waveform, n_fft, hop_length, win_length, window, c
     sin_phase = sin_phase.unsqueeze(1)
 
     # Transpose to expected (batch, channels, time_steps, freq_bins)
-    magnitude = magnitude.permute(0, 1, 3, 2)
-    cos_phase = cos_phase.permute(0, 1, 3, 2)
-    sin_phase = sin_phase.permute(0, 1, 3, 2)
+    magnitude = magnitude.transpose(-1, -2)
+    cos_phase = cos_phase.transpose(-1, -2)
+    sin_phase = sin_phase.transpose(-1, -2)
 
     return magnitude, cos_phase, sin_phase
 
