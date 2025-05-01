@@ -13,11 +13,12 @@ from data.waveform_mixers import SegmentMixer
 def calculate_stft_components(waveform, n_fft, hop_length, win_length, window, center, pad_mode):
     """Calculates STFT magnitude, cosine, and sine components using torchlibrosa.STFT."""
     # waveform shape: (batch, channels, time) -> needs (batch, time) for torchlibrosa.STFT
+    # Waveform is already on the target device
     if waveform.dim() == 3:
         waveform = waveform.squeeze(1)
     assert waveform.dim() == 2 # Expecting (batch, time)
     
-    # Instantiate the STFT extractor from torchlibrosa
+    # Instantiate the STFT extractor from torchlibrosa on the correct device
     stft_extractor = STFT(
         n_fft=n_fft,
         hop_length=hop_length,
@@ -26,7 +27,7 @@ def calculate_stft_components(waveform, n_fft, hop_length, win_length, window, c
         center=center,
         pad_mode=pad_mode,
         freeze_parameters=True,
-    ).to(waveform.device)
+    ).to(waveform.device) # Move extractor to the same device as waveform
 
     # Calculate STFT
     # Output shapes: (batch_size, 1, time_steps, n_fft // 2 + 1)
@@ -42,13 +43,20 @@ def calculate_stft_components(waveform, n_fft, hop_length, win_length, window, c
     return magnitude, cos_phase, sin_phase
 
 def save_precomputed_data(output_dir, index, data_dict):
-    """Saves the precomputed STFT data and text."""
+    """Saves the precomputed STFT data and text, ensuring tensors are on CPU."""
     filename = output_dir / f"item_{index:09d}.pt"
-    # Detach tensors before saving
-    for key in ['mixture_stft', 'segment_stft']:
-        if key in data_dict and isinstance(data_dict[key], tuple):
-             data_dict[key] = tuple(t.detach().cpu() for t in data_dict[key])
-    torch.save(data_dict, filename)
+    # Detach and move tensors to CPU before saving
+    cpu_data_dict = {}
+    for key, value in data_dict.items():
+        if isinstance(value, tuple):
+            # Handle tuples of tensors (like mixture_stft, segment_stft)
+            cpu_data_dict[key] = tuple(t.detach().cpu() for t in value if isinstance(t, torch.Tensor))
+        elif isinstance(value, torch.Tensor):
+            cpu_data_dict[key] = value.detach().cpu()
+        else:
+            cpu_data_dict[key] = value # Keep non-tensor data as is (e.g., text)
+            
+    torch.save(cpu_data_dict, filename)
 
 
 def main(args):
@@ -95,6 +103,12 @@ def main(args):
     )
     segment_mixer.eval() # Set to eval mode if it has dropout/batchnorm
 
+    # --- Device Selection ---
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    segment_mixer.to(device) # Move mixer to the selected device
+    # -----------------------
+
     print("Creating output directory...")
     output_dir = pathlib.Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -117,27 +131,26 @@ def main(args):
         waveforms = batch['waveform'] # Shape: (batch, 1, time)
         texts = batch['text']       # List of strings
         
-        # Ensure waveforms are on the correct device if using GPU
-        # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        # waveforms = waveforms.to(device)
-        # segment_mixer.to(device) 
-        # Note: Keeping on CPU for now for simplicity, add device logic if needed.
+        # Ensure waveforms are on the correct device
+        waveforms = waveforms.to(device)
+        # segment_mixer is already moved to the device
 
         with torch.no_grad():
-            # Mix waveforms
+            # Mix waveforms (computation happens on the selected device)
             mixtures, segments = segment_mixer(waveforms) # Output shapes: (batch, 1, time)
 
-            # Calculate STFT for mixtures
+            # Calculate STFT for mixtures (computation happens on the selected device)
             mixture_mag, mixture_cos, mixture_sin = calculate_stft_components(
                 mixtures, **stft_params
             )
              
-            # Calculate STFT for segments
+            # Calculate STFT for segments (computation happens on the selected device)
             segment_mag, segment_cos, segment_sin = calculate_stft_components(
                 segments, **stft_params
             )
 
         # Save each item in the batch individually
+        # Tensors are moved back to CPU within save_precomputed_data
         for i in range(waveforms.size(0)):
             # Check if we have enough samples left in the dataset
             if global_index < len(dataset):
