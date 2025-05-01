@@ -1,5 +1,6 @@
 /checkpoint
 /processed_data_files
+/mixture_stfts
 lightning_logs/
 workspace/
 __pycache__/
