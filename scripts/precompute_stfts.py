@@ -211,6 +211,7 @@ def process_files_for_recipes(data_files, target_recipe_file, configs):
         datafiles=data_files,
         sampling_rate=sampling_rate,
         max_clip_len=max_clip_len,
+        suppress_warnings=True # Suppress individual file loading warnings
     )
     print(f"Dataset size for this set: {len(dataset)}")
 
@@ -274,6 +275,11 @@ def process_files_for_recipes(data_files, target_recipe_file, configs):
     print(f"Saving {len(all_recipes)} recipes to {target_recipe_file}...")
     with open(target_recipe_file, 'w') as f:
         json.dump(all_recipes, f, indent=2)
+
+    # Report dropped count
+    dropped_count = dataset.get_dropped_count()
+    if dropped_count > 0:
+        print(f"Note: {dropped_count} audio files failed to load correctly and were replaced with random valid samples during recipe generation.")
 
     print(f"Finished generating recipes for {target_recipe_file.name}. Total items: {len(all_recipes)}.")
     return len(all_recipes)
@@ -361,6 +367,7 @@ def process_files_for_stfts(data_files, target_output_dir, recipe_file, configs,
         datafiles=data_files,
         sampling_rate=sampling_rate,
         max_clip_len=max_clip_len,
+        suppress_warnings=True # Suppress individual file loading warnings
     )
     print(f"Dataset size for this set: {len(dataset)}")
 
@@ -546,6 +553,11 @@ def process_files_for_stfts(data_files, target_output_dir, recipe_file, configs,
     # Final check
     if processed_count_for_set != len(recipes_dict):
         print(f"Warning: Number of processed items ({processed_count_for_set}) does not match number of recipes ({len(recipes_dict)}).")
+
+    # Report dropped count for STFT phase
+    dropped_count_stft = dataset.get_dropped_count()
+    if dropped_count_stft > 0:
+        print(f"Note: {dropped_count_stft} audio files failed to load correctly and were replaced with random valid samples during STFT computation.")
 
     print(f"Finished STFT processing for {target_output_dir}. Precomputed {processed_count_for_set} items.")
     return processed_count_for_set

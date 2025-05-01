@@ -16,6 +16,7 @@ class AudioTextDataset(Dataset):
         datafiles=[''], 
         sampling_rate=32000, 
         max_clip_len=5,
+        suppress_warnings=False,
     ):
         all_data_json = []
         for datafile in datafiles:
@@ -26,6 +27,8 @@ class AudioTextDataset(Dataset):
 
         self.sampling_rate = sampling_rate
         self.max_length = max_clip_len * sampling_rate
+        self.suppress_warnings = suppress_warnings
+        self.dropped_files_count = 0
 
     def __len__(self):
         return len(self.all_data_json)
@@ -59,7 +62,11 @@ class AudioTextDataset(Dataset):
             return text, audio_data, audio_rate
         
         except Exception as e:
-            print(f'error: {e} occurs, when loading {audio_path}')
+            self.dropped_files_count += 1
+            if not self.suppress_warnings:
+                try: path_info = audio_path
+                except NameError: path_info = f"item at index {index}"
+                print(f'Error: {e} occurred when loading {path_info}. Replacing with random item.')
             random_index = random.randint(0, len(self.all_data_json)-1)
             return self._read_audio(index=random_index)
 
@@ -89,3 +96,7 @@ class AudioTextDataset(Dataset):
         }
 
         return data_dict
+
+    def get_dropped_count(self):
+        """Returns the count of files that failed to load and were replaced."""
+        return self.dropped_files_count
