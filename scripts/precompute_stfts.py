@@ -11,45 +11,38 @@ from torch.utils.data import DataLoader
 # Assuming these imports are correct based on the project structure
 from data.audiotext_dataset import AudioTextDataset
 from data.waveform_mixers import SegmentMixer
+# Import STFT and magphase from torchlibrosa
+from torchlibrosa.stft import STFT, magphase
 
 def calculate_stft_components(waveform, n_fft, hop_length, win_length, window, center, pad_mode):
-    """Calculates STFT magnitude, cosine, and sine components using Spectrogram transform."""
-    # waveform shape: (batch, channels, time) -> needs (batch, time) for Spectrogram
-    waveform = waveform.squeeze(1) 
+    """Calculates STFT magnitude, cosine, and sine components using torchlibrosa.STFT."""
+    # waveform shape: (batch, channels, time) -> needs (batch, time) for torchlibrosa.STFT
+    if waveform.dim() == 3:
+        waveform = waveform.squeeze(1)
+    assert waveform.dim() == 2 # Expecting (batch, time)
     
-    window_fn = getattr(torch, f"{window}_window")
-
-    # Instantiate the Spectrogram transform
-    spectrogram_transform = torchaudio.transforms.Spectrogram(
+    # Instantiate the STFT extractor from torchlibrosa
+    stft_extractor = STFT(
         n_fft=n_fft,
         hop_length=hop_length,
         win_length=win_length,
-        window_fn=window_fn, # Note: pass the function itself
+        window=window, 
         center=center,
         pad_mode=pad_mode,
-        power=None, # Get complex output
-        normalized=False, # Or True, depending on model needs? Matching old behavior.
+        freeze_parameters=True,
     ).to(waveform.device)
 
-    # Apply the transform
-    stft_complex = spectrogram_transform(waveform) # Shape: (batch, freq, time_steps)
+    # Calculate STFT
+    # Output shapes: (batch_size, 1, time_steps, n_fft // 2 + 1)
+    real, imag = stft_extractor(waveform)
     
-    # If using older torchaudio that doesn't directly return complex from Spectrogram:
-    # Check if output is real/imag interleaved (..., 2) 
-    # if stft_complex.shape[-1] == 2 and not torch.is_complex(stft_complex):
-    #     stft_complex = torch.view_as_complex(stft_complex)
+    # Calculate magnitude and phase components
+    # Input shapes: (batch_size, 1, time_steps, n_fft // 2 + 1)
+    # Output shapes: (batch_size, 1, time_steps, n_fft // 2 + 1)
+    magnitude, cos_phase, sin_phase = magphase(real, imag)
 
-    magnitude = torch.abs(stft_complex)
-    phase = torch.angle(stft_complex)
-    cos_phase = torch.cos(phase)
-    sin_phase = torch.sin(phase)
-    
-    # Reshape to match model expectation (batch, channels, time_steps, freq_bins)
-    # Assuming mono, channels=1
-    magnitude = magnitude.unsqueeze(1).permute(0, 1, 3, 2) # (batch, 1, time_steps, freq)
-    cos_phase = cos_phase.unsqueeze(1).permute(0, 1, 3, 2) # (batch, 1, time_steps, freq)
-    sin_phase = sin_phase.unsqueeze(1).permute(0, 1, 3, 2) # (batch, 1, time_steps, freq)
-
+    # The output shape already matches the expected (batch, channels, time_steps, freq_bins)
+    # with channels=1.
     return magnitude, cos_phase, sin_phase
 
 def save_precomputed_data(output_dir, index, data_dict):
