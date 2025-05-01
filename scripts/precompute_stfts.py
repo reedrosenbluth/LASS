@@ -48,7 +48,7 @@ def calculate_stft_components(waveform, n_fft, hop_length, win_length, window, c
     # Calculate magnitude and phase components using the updated magphase function
     # Input shapes: (batch_size, freq_bins, time_steps)
     # Output shapes: (batch_size, freq_bins, time_steps)
-    magnitude, cos_phase, sin_phase = magphase(real, imag, power=1.0) # power=1.0 for magnitude
+    magnitude, cos_phase, sin_phase = magphase(real, imag)
 
     # Add channel dimension: (batch_size, 1, freq_bins, time_steps)
     magnitude = magnitude.unsqueeze(1)
