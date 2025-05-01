@@ -14,6 +14,11 @@ data:
         lower_db: -10
         higher_db: 10
     max_mix_num: 2
+    stft_hop_length: 160
+    stft_window: 'hann'
+    stft_center: true
+    stft_pad_mode: 'reflect'
+    stft_win_lengths: [256, 512, 2048]
 
 model:
     query_net: CLAP
