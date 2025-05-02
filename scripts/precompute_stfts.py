@@ -4,13 +4,14 @@ import argparse
 import yaml
 from tqdm import tqdm
 import pathlib
-import json # Added for recipe saving
-import random # Added for recipe generation mimicking mixer
+import json
+import random
 from torch.utils.data import DataLoader
 from torchlibrosa.stft import STFT, magphase
 
 from data.audiotext_dataset import AudioTextDataset
 from data.waveform_mixers import SegmentMixer
+from data.waveform_mixers import dynamic_loudnorm as mixer_dynamic_loudnorm
 
 def calculate_stft_components(waveform, n_fft, hop_length, win_length, window, center, pad_mode):
     """Calculates STFT magnitude, cosine, and sine components using torchlibrosa.STFT."""
@@ -41,10 +42,6 @@ def calculate_stft_components(waveform, n_fft, hop_length, win_length, window, c
     # Output shapes: (batch_size, freq_bins, time_steps) <- Note: torchlibrosa convention freq first
     real, imag = stft_extractor(waveform)
     
-    # Transpose to match (batch_size, time_steps, freq_bins) convention if needed
-    # Current shape seems to be (batch_size, freq_bins, time_steps) based on torchlibrosa docs
-    # Let's keep it as is first and adjust if downstream expects time_steps first
-
     # Calculate magnitude and phase components using the updated magphase function
     # Input shapes: (batch_size, freq_bins, time_steps)
     # Output shapes: (batch_size, freq_bins, time_steps)
@@ -111,8 +108,6 @@ def save_precomputed_data(output_dir, index, data_dict):
     torch.save(cpu_data_dict, filename)
 
 
-# --- Phase 1: Recipe Generation ---
-
 def generate_mixture_recipes_for_batch(texts, max_mix_num, batch_size):
     """
     Generates mixture recipes for a batch based on SegmentMixer logic,
@@ -137,9 +132,9 @@ def generate_mixture_recipes_for_batch(texts, max_mix_num, batch_size):
         primary_text = texts[n]
         # Mimic SegmentMixer logic: mix_num segments total, including primary
         # Ensure mix_num is at least 2 if max_mix_num allows
-        actual_max_mix = min(max_mix_num, batch_size) # Cannot mix more items than available in batch
-        min_mix = 2 if actual_max_mix >= 2 else actual_max_mix # Need at least 2 if possible
-        if min_mix > actual_max_mix: # Handle edge case batch_size=1
+        actual_max_mix = min(max_mix_num, batch_size)
+        min_mix = 2 if actual_max_mix >= 2 else actual_max_mix
+        if min_mix > actual_max_mix:
              mix_num = 1
         else:
              mix_num = random.randint(min_mix, actual_max_mix)
@@ -181,7 +176,6 @@ def generate_mixture_recipes_for_batch(texts, max_mix_num, batch_size):
 
 
         recipe = {
-            # 'output_index' will be added later based on global count
             'primary_segment_index_in_batch': n,
             'primary_segment_text': primary_text,
             'mixture_component_texts': component_texts, # Includes primary text
@@ -198,44 +192,37 @@ def process_files_for_recipes(data_files, target_recipe_file, configs):
     print(f"Generating recipes for output file: {target_recipe_file}")
     target_recipe_file.parent.mkdir(parents=True, exist_ok=True) # Ensure parent dir exists
 
-    # --- Extract parameters needed for Dataset/DataLoader/RecipeGen ---
     sampling_rate = configs['data']['sampling_rate']
     max_clip_len = configs['data']['segment_seconds']
     max_mix_num = configs['data']['max_mix_num']
     batch_size = configs['train']['batch_size_per_device']
     num_workers = configs['train']['num_workers']
-    # --- End Parameter Extraction ---
 
     print("Initializing dataset...")
     dataset = AudioTextDataset(
         datafiles=data_files,
         sampling_rate=sampling_rate,
         max_clip_len=max_clip_len,
-        suppress_warnings=True # Suppress individual file loading warnings
+        suppress_warnings=True
     )
     print(f"Dataset size for this set: {len(dataset)}")
 
     if not dataset:
         print(f"Warning: No data found for files: {data_files}. Skipping recipe generation for {target_recipe_file.name}")
-        # Save an empty list if no data
         with open(target_recipe_file, 'w') as f:
             json.dump([], f, indent=2)
         return 0
 
-    # Mixer logic requires batch_size >= max_mix_num to guarantee enough items for wrap-around mixing
-    # Adjust batch size if necessary, although user should ideally configure this appropriately
     effective_batch_size = batch_size
     if batch_size < max_mix_num and len(dataset) >= max_mix_num:
         print(f"Warning: configured batch_size ({batch_size}) < max_mix_num ({max_mix_num}). "
               f"Recipe generation might behave unexpectedly if wrap-around needs more items than batch provides. "
               f"Consider increasing batch_size >= {max_mix_num} or ensure dataset splits work with current batch size.")
-        # We proceed with the configured batch_size but the warning stands.
-        # The generate_mixture_recipes_for_batch handles cases where batch_size < mix_num is requested.
 
     dataloader = DataLoader(
         dataset,
         batch_size=effective_batch_size,
-        shuffle=False, # CRITICAL: Must be False for recipes to match Phase 2 order
+        shuffle=False, # Must be False for recipes to match Phase 2 order
         num_workers=num_workers,
         collate_fn=None
     )
@@ -246,9 +233,9 @@ def process_files_for_recipes(data_files, target_recipe_file, configs):
 
     for batch in tqdm(dataloader):
         texts = batch['text']
-        current_batch_size = len(texts) # Actual batch size might be smaller for last batch
+        current_batch_size = len(texts)
 
-        if current_batch_size == 0: continue # Skip empty batches
+        if current_batch_size == 0: continue
 
         # Generate recipes for this batch
         batch_recipes = generate_mixture_recipes_for_batch(
@@ -284,40 +271,6 @@ def process_files_for_recipes(data_files, target_recipe_file, configs):
     print(f"Finished generating recipes for {target_recipe_file.name}. Total items: {len(all_recipes)}.")
     return len(all_recipes)
 
-
-# --- Phase 2: STFT Computation (Modified from original process_files) ---
-
-# Helper function for dynamic loudness normalization, mimicking SegmentMixer's internal logic
-# Requires access to the energy ratio calculation if possible, otherwise approximates.
-# Let's try to import the specific function if it's accessible and standalone.
-try:
-    # Attempt to import the specific helper if it exists and is usable standalone
-    from data.waveform_mixers import dynamic_loudnorm as mixer_dynamic_loudnorm
-    print("Using dynamic_loudnorm from data.waveform_mixers")
-except ImportError:
-    print("Could not import dynamic_loudnorm from data.waveform_mixers, using local implementation.")
-    # Local implementation as fallback if import fails or function isn't suitable standalone
-    def mixer_dynamic_loudnorm(audio, reference, lower_db=-10, higher_db=10):
-        """ Standalone implementation mimicking dynamic loudness normalization """
-        with torch.no_grad():
-            # Ensure inputs are tensors and on the same device
-            if not isinstance(audio, torch.Tensor): audio = torch.tensor(audio)
-            if not isinstance(reference, torch.Tensor): reference = torch.tensor(reference)
-            device = reference.device
-            audio = audio.to(device)
-
-            # Energy calculation (handle potential channel dim)
-            energy_audio = torch.mean(audio.squeeze() ** 2)
-            energy_ref = torch.mean(reference.squeeze() ** 2)
-            ratio = (energy_ref / torch.clamp(energy_audio, min=1e-10)) ** 0.5
-            ratio = torch.clamp(ratio, 0.02, 50) # Bounds from original SegmentMixer's get_energy_ratio
-
-        rescaled_audio = audio * ratio
-        delta_loudness = random.uniform(lower_db, higher_db)
-        gain = np.power(10.0, delta_loudness / 20.0)
-        return (gain * rescaled_audio).to(audio.dtype) # Ensure dtype consistency
-
-
 def process_files_for_stfts(data_files, target_output_dir, recipe_file, configs, common_stft_params_for_saving):
     """
     Processes data files using pre-generated recipes: loads data, performs mixing
@@ -327,7 +280,6 @@ def process_files_for_stfts(data_files, target_output_dir, recipe_file, configs,
     print(f"Output directory: {target_output_dir}")
     target_output_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- Load Recipes ---
     print(f"Loading recipes from {recipe_file}...")
     try:
         with open(recipe_file, 'r') as f:
@@ -335,7 +287,6 @@ def process_files_for_stfts(data_files, target_output_dir, recipe_file, configs,
         if not recipes:
              print("Recipe file is empty. Nothing to process.")
              return 0
-        # Convert recipes to a dictionary keyed by output_index for efficient lookup
         recipes_dict = {recipe['output_index']: recipe for recipe in recipes}
         print(f"Loaded {len(recipes_dict)} recipes.")
     except FileNotFoundError:
@@ -345,29 +296,25 @@ def process_files_for_stfts(data_files, target_output_dir, recipe_file, configs,
         print(f"Error: Could not decode JSON from recipe file: {recipe_file}")
         raise
 
-    # --- Extract parameters from config ---
     sampling_rate = configs['data']['sampling_rate']
     max_clip_len = configs['data']['segment_seconds']
-    # max_mix_num = configs['data']['max_mix_num'] # Not directly needed, mix_num comes from recipe
     lower_db = configs['data']['loudness_norm']['lower_db']
     higher_db = configs['data']['loudness_norm']['higher_db']
     batch_size = configs['train']['batch_size_per_device']
     num_workers = configs['train']['num_workers']
 
-    # STFT params
     stft_hop_length = configs['data']['stft_hop_length']
     stft_window = configs['data']['stft_window']
     stft_center = configs['data']['stft_center']
     stft_pad_mode = configs['data']['stft_pad_mode']
     stft_win_lengths = configs['data']['stft_win_lengths']
-    # --- End Parameter Extraction ---
 
     print("Initializing dataset...")
     dataset = AudioTextDataset(
         datafiles=data_files,
         sampling_rate=sampling_rate,
         max_clip_len=max_clip_len,
-        suppress_warnings=True # Suppress individual file loading warnings
+        suppress_warnings=True
     )
     print(f"Dataset size for this set: {len(dataset)}")
 
@@ -375,26 +322,19 @@ def process_files_for_stfts(data_files, target_output_dir, recipe_file, configs,
         print(f"Warning: No data found for files: {data_files}. Skipping STFT computation for {target_output_dir}")
         return 0
 
-    # Ensure batch size used here matches (or is compatible with) the one used for recipe generation
-    # If recipes were generated with a smaller batch size, this might affect index mapping if not careful.
-    # Using shuffle=False and assuming the same batch size is the safest approach.
     effective_batch_size = batch_size
-    # Potential check: compare effective_batch_size with recipe generation context if stored?
 
     dataloader = DataLoader(
         dataset,
         batch_size=effective_batch_size,
-        shuffle=False, # CRITICAL: Must be False and match Phase 1 DataLoader order
+        shuffle=False,
         num_workers=num_workers,
         collate_fn=None
     )
 
-    # --- Device Selection ---
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
-    # Mixer class instance not needed directly, but params are used by helper
     loudness_params = {'lower_db': lower_db, 'higher_db': higher_db}
-    # -----------------------
 
     print("Starting STFT precomputation loop guided by recipes...")
     processed_count_for_set = 0
@@ -402,14 +342,14 @@ def process_files_for_stfts(data_files, target_output_dir, recipe_file, configs,
 
     for batch_idx, batch in enumerate(tqdm(dataloader)):
         waveforms = batch['waveform'].to(device) # Shape: (batch, 1, time)
-        texts = batch['text']       # List of strings from batch (for reference/debug)
+        texts = batch['text']
         current_batch_size = waveforms.size(0)
 
         if current_batch_size == 0: continue
 
         batch_mixtures = []
         batch_segments = []
-        batch_recipes_used = [] # Store recipes used for this batch
+        batch_recipes_used = []
 
         # Process each item in the batch according to its recipe
         for i in range(current_batch_size):
@@ -426,7 +366,7 @@ def process_files_for_stfts(data_files, target_output_dir, recipe_file, configs,
 
             batch_recipes_used.append(recipe) # Store for saving later
 
-            # --- Reconstruct mixture based on recipe ---
+            # Reconstruct mixture based on recipe
             primary_segment_index_in_batch = recipe['primary_segment_index_in_batch']
             # Ensure this matches current position 'i' if recipes were generated sequentially within batches
             if primary_segment_index_in_batch != i:
@@ -484,7 +424,6 @@ def process_files_for_stfts(data_files, target_output_dir, recipe_file, configs,
 
             batch_mixtures.append(mixture)
             batch_segments.append(clipped_primary_segment) # Store the primary segment (potentially clipped)
-            # --- End Mixture Reconstruction ---
 
         if not batch_mixtures: # If no valid mixtures were generated for this batch
             global_item_index_tracker += current_batch_size # Still advance tracker
@@ -494,17 +433,17 @@ def process_files_for_stfts(data_files, target_output_dir, recipe_file, configs,
         mixtures_tensor = torch.stack(batch_mixtures, dim=0)
         segments_tensor = torch.stack(batch_segments, dim=0)
 
-        # --- Compute STFTs for the batch ---
+        # Compute STFTs for the batch
         with torch.no_grad():
             batch_mixture_stfts = {win_len: None for win_len in stft_win_lengths}
             batch_segment_stfts = {win_len: None for win_len in stft_win_lengths}
 
             for win_length in stft_win_lengths:
-                n_fft = win_length # Use win_length as n_fft
+                n_fft = win_length
                 current_stft_params = {
                     'n_fft': n_fft,
                     'hop_length': stft_hop_length,
-                    'win_length': win_length, # Ensure win_length is passed
+                    'win_length': win_length,
                     'window': stft_window,
                     'center': stft_center,
                     'pad_mode': stft_pad_mode,
@@ -519,9 +458,8 @@ def process_files_for_stfts(data_files, target_output_dir, recipe_file, configs,
                     segments_tensor, **current_stft_params
                 )
                 batch_segment_stfts[win_length] = (segment_mag, segment_cos, segment_sin)
-        # --- End STFT Computation ---
 
-        # --- Save individual items from the batch ---
+        # Save individual items from the batch
         num_items_in_batch_processed = mixtures_tensor.size(0) # Use actual number processed
         for i in range(num_items_in_batch_processed):
             recipe_for_item = batch_recipes_used[i] # Get recipe corresponding to this processed item
@@ -550,11 +488,9 @@ def process_files_for_stfts(data_files, target_output_dir, recipe_file, configs,
 
         global_item_index_tracker += current_batch_size # Advance tracker by processed batch size
 
-    # Final check
     if processed_count_for_set != len(recipes_dict):
         print(f"Warning: Number of processed items ({processed_count_for_set}) does not match number of recipes ({len(recipes_dict)}).")
 
-    # Report dropped count for STFT phase
     dropped_count_stft = dataset.get_dropped_count()
     if dropped_count_stft > 0:
         print(f"Note: {dropped_count_stft} audio files failed to load correctly and were replaced with random valid samples during STFT computation.")
@@ -571,7 +507,7 @@ def main(args, parser):
     with open(args.config_yaml, 'r') as f:
         configs = yaml.safe_load(f)
 
-    # --- Extract only STFT common parameters needed by both processes ---
+    # Extract only STFT common parameters needed by both processes
     # Other params (batch size, num workers, etc.) are read inside process_files
     stft_hop_length = configs['data']['stft_hop_length']
     stft_window = configs['data']['stft_window']
@@ -585,9 +521,8 @@ def main(args, parser):
         'center': stft_center,
         'pad_mode': stft_pad_mode,
     }
-    # -------------------------------------------------------------------
 
-    # --- Load data file paths ---
+    # Load data file paths
     # Check command line args first, then fall back to config
     train_files_source = "command line"
     val_files_source = "command line"
@@ -621,7 +556,6 @@ def main(args, parser):
         parser.error("Training data file list cannot be empty (check command line or config).")
     if not args.val_data_files:
         parser.error("Validation data file list cannot be empty (check command line or config).")
-    # --- End Loading Data File Paths ---
 
 
     if args.mode == 'generate_recipes':
@@ -634,51 +568,48 @@ def main(args, parser):
         train_recipe_file = base_recipe_dir / "train_mixture_recipes.json"
         val_recipe_file = base_recipe_dir / "val_mixture_recipes.json"
 
-        # --- Process Training Files ---
+        # Process Training Files
         print("\n--- Processing Training Set Recipes ---")
         total_train_processed = process_files_for_recipes(
             data_files=args.train_data_files,
             target_recipe_file=train_recipe_file,
             configs=configs
         )
-        # ----------------------------
 
-        # --- Process Validation Files ---
+        # Process Validation Files
         print("\n--- Processing Validation Set Recipes ---")
         total_val_processed = process_files_for_recipes(
             data_files=args.val_data_files,
             target_recipe_file=val_recipe_file,
             configs=configs
         )
-        # ------------------------------
 
         print(f"\nFinished all recipe processing.")
         print(f"Total training items processed: {total_train_processed}")
         print(f"Total validation items processed: {total_val_processed}")
 
     elif args.mode == 'compute_stfts':
-        # --- Validate required arguments for this mode ---
+        # Validate required arguments for this mode
         if not args.output_dir:
              parser.error("--output_dir is required for 'compute_stfts' mode.")
         if not args.input_recipe_dir:
              parser.error("--input_recipe_dir is required for 'compute_stfts' mode.")
 
-        # --- Setup STFT Output Dirs (Moved INSIDE this block) ---
+        # Setup STFT Output Dirs (Moved INSIDE this block)
         base_output_dir = pathlib.Path(args.output_dir)
         train_output_dir = base_output_dir / "train"
         val_output_dir = base_output_dir / "val"
         print(f"STFT output directory: {base_output_dir}")
         print(f"Training STFT output directory: {train_output_dir}")
         print(f"Validation STFT output directory: {val_output_dir}")
-        # -----------------------------------------------------
 
-        # --- Setup Recipe Input Paths ---
+        # Setup Recipe Input Paths
         base_recipe_dir = pathlib.Path(args.input_recipe_dir)
         train_recipe_file = base_recipe_dir / "train_mixture_recipes.json"
         val_recipe_file = base_recipe_dir / "val_mixture_recipes.json"
         print(f"Recipe input directory: {base_recipe_dir}")
 
-        # --- Extract STFT common parameters for saving ---
+        # Extract STFT common parameters for saving
         # Ensure 'data' key exists before accessing subkeys
         if 'data' not in configs:
              parser.error("Missing 'data' section in config YAML required for STFT parameters.")
@@ -698,9 +629,8 @@ def main(args, parser):
             'center': stft_center,
             'pad_mode': stft_pad_mode,
         }
-        # -------------------------------------------------------------------
 
-        # --- Process Training Files ---
+        # Process Training Files
         print("\n--- Processing Training Set STFTs ---")
         total_train_processed = process_files_for_stfts(
             data_files=args.train_data_files,
@@ -709,9 +639,8 @@ def main(args, parser):
             configs=configs,
             common_stft_params_for_saving=common_stft_params_for_saving
         )
-        # ----------------------------
 
-        # --- Process Validation Files ---
+        # Process Validation Files
         print("\n--- Processing Validation Set STFTs ---")
         total_val_processed = process_files_for_stfts(
             data_files=args.val_data_files,
@@ -720,7 +649,6 @@ def main(args, parser):
             configs=configs,
             common_stft_params_for_saving=common_stft_params_for_saving
         )
-        # ------------------------------
 
         print(f"\nFinished STFT computation.")
         print(f"Total training items processed: {total_train_processed}")
@@ -730,21 +658,15 @@ def main(args, parser):
         # Raise error if mode not recognized
         parser.error("Invalid mode selected. Choose 'generate_recipes' or 'compute_stfts'.")
 
-    # Argument validation now happens inside main() or via parser.error calls.
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Precompute STFTs or generate mixture recipes based on YAML config.")
 
-    # --- Mode Selection ---
     parser.add_argument('--mode', type=str, required=True,
                         help='Mode of operation: "generate_recipes" or "compute_stfts".')
 
-    # --- Config File Argument ---
     parser.add_argument('--config_yaml', type=str, required=True,
                         help='Path to the base configuration YAML file.')
 
-    # --- Dataset/Output Arguments ---
     parser.add_argument('--train_data_files', type=str, default=None, nargs='+',
                         help='Path(s) to the training dataset JSON file(s) (overrides config if specified).')
     parser.add_argument('--val_data_files', type=str, default=None, nargs='+',
@@ -757,7 +679,5 @@ if __name__ == "__main__":
                         help="Directory containing recipe JSON files to use (mode='compute_stfts'). Expects train_mixture_recipes.json and val_mixture_recipes.json.")
 
     args = parser.parse_args()
-
-    # Argument validation now happens inside main() or via parser.error calls.
 
     main(args, parser) # Pass parser to main 
