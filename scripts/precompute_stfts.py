@@ -171,10 +171,6 @@ def generate_mixture_recipes_for_batch(texts, original_audiopaths, max_mix_num, 
              while added_count < num_to_add and attempts < batch_size * 2:
                  current_idx_pos = (current_idx_pos + 1) % batch_size
                  component_original_path = original_audiopaths[current_idx_pos]
-                 # ---- DEBUG PRINT ----
-                 if n < 5 and current_idx_pos < 5: # Limit printing to likely duplicate cases early in batch
-                     print(f"DEBUG: n={n}, primary_path='{primary_original_path}', current_idx_pos={current_idx_pos}, component_path='{component_original_path}', Paths_Equal={primary_original_path == component_original_path})")
-                 # ---- END DEBUG ----
                  # Check: not same index, not already added, AND not same original path
                  if (current_idx_pos != n and
                      current_idx_pos not in indices_to_add and
