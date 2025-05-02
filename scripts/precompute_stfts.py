@@ -52,16 +52,18 @@ def calculate_stft_components(waveform, n_fft, hop_length, win_length, window, c
     cos_phase = cos_phase.unsqueeze(1) # Shape becomes (B, 1, F, T)
     sin_phase = sin_phase.unsqueeze(1) # Shape becomes (B, 1, F, T)
 
-    # Transpose to expected (batch, channels, time_steps, freq_bins)
-    magnitude_t = magnitude.transpose(-1, -2) # Should swap F and T -> (B, 1, T, F)
-    cos_phase_t = cos_phase.transpose(-1, -2) # Should swap F and T -> (B, 1, T, F)
-    sin_phase_t = sin_phase.transpose(-1, -2) # Should swap F and T -> (B, 1, T, F)
+    # Permute dimensions to expected (batch, channels, time_steps, freq_bins)
+    # Original indices: 0=B, 1=C, 2=F, 3=T
+    # Target indices:   0=B, 1=C, 3=T, 2=F
+    magnitude_p = magnitude.permute(0, 1, 3, 2)
+    cos_phase_p = cos_phase.permute(0, 1, 3, 2)
+    sin_phase_p = sin_phase.permute(0, 1, 3, 2)
 
-    # Debug print inside the function after transpose
-    if magnitude.numel() > 0: # Avoid error on empty batch
-        print(f"DEBUG: Shape INSIDE func AFTER transpose: {magnitude_t.shape}")
+    # Debug print inside the function after permute (optional, can be removed later)
+    # if magnitude.numel() > 0: # Avoid error on empty batch
+    #    print(f"DEBUG: Shape INSIDE func AFTER permute: {magnitude_p.shape}")
 
-    return magnitude_t, cos_phase_t, sin_phase_t
+    return magnitude_p, cos_phase_p, sin_phase_p
 
 def save_batch_precomputed_data(output_dir, batch_index, batch_data_list):
     """
