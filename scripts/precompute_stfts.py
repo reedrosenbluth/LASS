@@ -119,13 +119,14 @@ def save_batch_precomputed_data(output_dir, batch_index, batch_data_list):
         # For now, let's print and return 0 items saved for this batch
         return 0
 
-def generate_mixture_recipes_for_batch(texts, max_mix_num, batch_size):
+def generate_mixture_recipes_for_batch(texts, original_audiopaths, max_mix_num, batch_size):
     """
     Generates mixture recipes for a batch based on SegmentMixer logic,
     without performing audio processing.
 
     Args:
         texts (List[str]): List of texts corresponding to waveforms in the batch.
+        original_audiopaths (List[str]): List of original audio paths corresponding to waveforms in the batch.
         max_mix_num (int): Maximum number of segments to mix.
         batch_size (int): The size of the current batch.
 
@@ -137,10 +138,12 @@ def generate_mixture_recipes_for_batch(texts, max_mix_num, batch_size):
                     - 'mixture_component_texts': List of texts of all segments in the mixture (including primary).
                     - 'component_indices_in_batch': Indices within the batch of segments used.
                     - 'mix_num': The number of segments mixed for this item (randomly chosen).
+                    - 'original_audiopath': Original audio path of the primary segment.
     """
     batch_recipes = []
     for n in range(batch_size):
         primary_text = texts[n]
+        primary_original_path = original_audiopaths[n]
         # Mimic SegmentMixer logic: mix_num segments total, including primary
         # Ensure mix_num is at least 2 if max_mix_num allows
         actual_max_mix = min(max_mix_num, batch_size)
@@ -167,18 +170,29 @@ def generate_mixture_recipes_for_batch(texts, max_mix_num, batch_size):
              attempts = 0 # Prevent infinite loops in edge cases
              while added_count < num_to_add and attempts < batch_size * 2:
                  current_idx_pos = (current_idx_pos + 1) % batch_size
-                 if current_idx_pos != n and current_idx_pos not in indices_to_add:
+                 component_original_path = original_audiopaths[current_idx_pos]
+                 # Check: not same index, not already added, AND not same original path
+                 if (current_idx_pos != n and
+                     current_idx_pos not in indices_to_add and
+                     component_original_path != primary_original_path):
                      indices_to_add.append(current_idx_pos)
                      added_count += 1
-                 attempts += 1
+                 attempts += 1 # Indent this correctly
              if added_count < num_to_add:
-                 # Fallback if wrap-around didn't find enough unique items (shouldn't happen with batch_size >= mix_num)
-                 print(f"Warning: Could only find {added_count} unique items to mix for item {n} (requested {num_to_add}). Using available.")
-                 # Add remaining random indices if needed (less ideal, but prevents crash)
+                 # Fallback if wrap-around didn't find enough unique items
+                 print(f"Warning: Could only find {added_count} unique items (with different original paths) to mix for item {n} (path: {primary_original_path}, requested {num_to_add}). Using available.")
+                 # Add remaining random indices if needed
                  remaining_needed = num_to_add - added_count
-                 available_others = [idx for idx in possible_indices if idx not in indices_to_add]
+                 # Filter fallback candidates based on original path as well
+                 available_others = [idx for idx in possible_indices
+                                     if idx not in indices_to_add and
+                                     original_audiopaths[idx] != primary_original_path]
                  random.shuffle(available_others)
                  indices_to_add.extend(available_others[:remaining_needed])
+                 # Update added_count based on how many were actually added in fallback
+                 added_count += len(available_others[:remaining_needed])
+                 if added_count < num_to_add:
+                     print(f"Warning: Even after fallback, only {added_count} components found for item {n}.")
 
 
         for comp_idx in indices_to_add:
@@ -191,7 +205,8 @@ def generate_mixture_recipes_for_batch(texts, max_mix_num, batch_size):
             'primary_segment_text': primary_text,
             'mixture_component_texts': component_texts, # Includes primary text
             'component_indices_in_batch': component_indices, # Includes primary index
-            'mix_num': len(component_indices) # Actual number mixed, derived from components
+            'mix_num': len(component_indices), # Actual number mixed, derived from components
+            'original_audiopath': primary_original_path # Add primary path to recipe for reference
         }
         batch_recipes.append(recipe)
     return batch_recipes
@@ -253,6 +268,7 @@ def process_files_for_recipes(data_files, target_recipe_file, configs):
         # Generate recipes for this batch
         batch_recipes = generate_mixture_recipes_for_batch(
             texts=texts,
+            original_audiopaths=original_audiopaths,
             max_mix_num=max_mix_num,
             batch_size=current_batch_size
         )
