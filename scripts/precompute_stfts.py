@@ -249,6 +249,8 @@ def process_files_for_recipes(data_files, target_recipe_file, configs):
 
     for batch in tqdm(dataloader):
         texts = batch['text']
+        # Retrieve the original audio paths from the batch
+        original_audiopaths = batch['original_audiopath']
         current_batch_size = len(texts)
 
         if current_batch_size == 0: continue
@@ -270,6 +272,8 @@ def process_files_for_recipes(data_files, target_recipe_file, configs):
                  # This might indicate an issue in generate_mixture_recipes_for_batch index handling
 
             recipe['output_index'] = global_item_index + i # Assign global index based on position in dataloader
+            # Add the original audio path for this item to the recipe
+            recipe['original_audiopath'] = original_audiopaths[i]
             all_recipes.append(recipe)
 
         global_item_index += current_batch_size # Increment by the actual number processed in this batch
@@ -303,8 +307,9 @@ def process_files_for_stfts(data_files, target_output_dir, recipe_file, configs,
         if not recipes:
              print("Recipe file is empty. Nothing to process.")
              return 0
-        recipes_dict = {recipe['output_index']: recipe for recipe in recipes}
-        print(f"Loaded {len(recipes_dict)} recipes.")
+        # Create a dictionary mapping original_audiopath to recipe
+        recipes_dict = {recipe['original_audiopath']: recipe for recipe in recipes}
+        print(f"Loaded {len(recipes_dict)} recipes, indexed by original audio path.")
     except FileNotFoundError:
         print(f"Error: Recipe file not found at {recipe_file}")
         raise
@@ -359,6 +364,8 @@ def process_files_for_stfts(data_files, target_output_dir, recipe_file, configs,
     for batch_idx, batch in enumerate(tqdm(dataloader)):
         waveforms = batch['waveform'].to(device) # Shape: (batch, 1, time)
         texts = batch['text']
+        # Get original audio paths from the batch
+        original_audiopaths = batch['original_audiopath']
         current_batch_size = waveforms.size(0)
 
         if current_batch_size == 0: continue
@@ -370,16 +377,16 @@ def process_files_for_stfts(data_files, target_output_dir, recipe_file, configs,
 
         # Process each item in the batch according to its recipe
         for i in range(current_batch_size):
-            current_global_index = global_item_index_tracker + i
-            recipe = recipes_dict.get(current_global_index)
+            # Use original_audiopath to find the correct recipe
+            current_original_path = original_audiopaths[i]
+            recipe = recipes_dict.get(current_original_path)
 
             if recipe is None:
-                print(f"Warning: No recipe found for expected output index {current_global_index}. Skipping item.")
+                # This can happen if a file was present during recipe generation but failed
+                # catastrophically (e.g., file deleted) during STFT loading, and its replacement
+                # also happened to be a file whose original path wasn't in the recipes.
+                print(f"Warning: No recipe found for original audio path '{current_original_path}'. Skipping item {i} in batch {batch_idx}.")
                 continue
-
-            # Basic check: Compare primary text from batch with recipe's primary text
-            if texts[i] != recipe['primary_segment_text']:
-                 print(f"Warning: Text mismatch for index {current_global_index}. Batch text: '{texts[i]}', Recipe text: '{recipe['primary_segment_text']}'. Proceeding, but check data consistency.")
 
             batch_recipes_used.append(recipe) # Store for saving later
 
@@ -387,7 +394,7 @@ def process_files_for_stfts(data_files, target_output_dir, recipe_file, configs,
             primary_segment_index_in_batch = recipe['primary_segment_index_in_batch']
             # Ensure this matches current position 'i' if recipes were generated sequentially within batches
             if primary_segment_index_in_batch != i:
-                 print(f"Warning: Recipe primary index in batch ({primary_segment_index_in_batch}) doesn't match current item index in batch ({i}) for global index {current_global_index}. Using index {i} waveform as primary.")
+                 print(f"Warning: Recipe primary index in batch ({primary_segment_index_in_batch}) doesn't match current item index in batch ({i}) for global index {i}.")
                  primary_segment = waveforms[i].clone()
             else:
                  primary_segment = waveforms[primary_segment_index_in_batch].clone()
@@ -406,7 +413,7 @@ def process_files_for_stfts(data_files, target_output_dir, recipe_file, configs,
 
                 # Check if the component index is valid for the current batch size
                 if comp_idx_in_batch >= current_batch_size:
-                     print(f"Warning: Component index {comp_idx_in_batch} from recipe is out of bounds for current batch size {current_batch_size}. Skipping component for item {current_global_index}.")
+                     print(f"Warning: Component index {comp_idx_in_batch} from recipe is out of bounds for current batch size {current_batch_size}. Skipping component for item {i}.")
                      continue
 
                 next_segment = waveforms[comp_idx_in_batch]

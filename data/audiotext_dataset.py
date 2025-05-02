@@ -49,30 +49,38 @@ class AudioTextDataset(Dataset):
 
         return waveform
 
-    def _read_audio(self, index):
+    def _read_audio(self, index, original_path=None):
+        # Get the intended path *before* the try block
+        intended_audio_path = self.all_data_json[index]['wav']
+        if original_path is None:
+            original_path = intended_audio_path # Store the path of the first attempt
+
         try:
-            audio_path = self.all_data_json[index]['wav']
+            # Use intended_audio_path for loading attempt
+            audio_path = intended_audio_path
             audio_data, audio_rate = torchaudio.load(audio_path, channels_first=True)
             text = self.all_data_json[index]['caption']
 
             # drop short utterance
             if audio_data.size(1) < self.sampling_rate * 0.5:
-                raise Exception(f'{audio_path} is too short, drop it ...') 
-            
-            return text, audio_data, audio_rate
-        
+                raise Exception(f'{audio_path} is too short, drop it ...')
+
+            # Return original_path along with other data
+            return text, audio_data, audio_rate, original_path
+
         except Exception as e:
             self.dropped_files_count += 1
             if not self.suppress_warnings:
-                try: path_info = audio_path
-                except NameError: path_info = f"item at index {index}"
-                print(f'Error: {e} occurred when loading {path_info}. Replacing with random item.')
+                # Use original_path for error message context
+                print(f'Error: {e} occurred when loading {original_path} (intended item index {index}). Replacing with random item.')
             random_index = random.randint(0, len(self.all_data_json)-1)
-            return self._read_audio(index=random_index)
+            # Pass the original_path down the recursive call
+            return self._read_audio(index=random_index, original_path=original_path)
 
     def __getitem__(self, index):
-        # create a audio tensor  
-        text, audio_data, audio_rate = self._read_audio(index)
+        # create a audio tensor
+        # Capture original_path returned by _read_audio
+        text, audio_data, audio_rate, original_path = self._read_audio(index)
         audio_len = audio_data.shape[1] / audio_rate
         # convert stero to single channel
         if audio_data.shape[0] > 1:
@@ -90,9 +98,10 @@ class AudioTextDataset(Dataset):
         audio_data = self._cut_or_randomcrop(audio_data)            
 
         data_dict = {
-            'text': text, 
-            'waveform': audio_data,  
-            'modality': 'audio_text'
+            'text': text,
+            'waveform': audio_data,
+            'modality': 'audio_text',
+            'original_audiopath': original_path
         }
 
         return data_dict
