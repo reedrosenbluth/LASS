@@ -32,7 +32,7 @@ def inspect_batch_file(filepath):
 
             # Print info about STFT tensors
             if 'stfts' in item_data and isinstance(item_data['stfts'], dict):
-                print("\n  STFTs (Shapes: [Channel=1, FreqBins, TimeSteps]):")
+                print("\n  STFTs (Shapes: [Channel=1, TimeSteps, FreqBins]):")
                 for source_type, stft_results in item_data['stfts'].items():
                      print(f"    Source: {source_type}")
                      if isinstance(stft_results, dict):

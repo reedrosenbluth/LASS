@@ -44,10 +44,10 @@ def calculate_stft_components(waveform, n_fft, hop_length, win_length, window, c
     
     # Calculate magnitude and phase components using the updated magphase function
     # Input shapes: (batch_size, freq_bins, time_steps)
-    # Output shapes from magphase seem to be (B, 1, F, T) in this env
+    # Output shapes seem to be (B, 1, T, F) after contiguous()
     magnitude, cos_phase, sin_phase = magphase(real, imag)
 
-    # Ensure output is contiguous - return directly as (B, 1, F, T)
+    # Ensure output is contiguous - return directly as (B, 1, T, F)
     magnitude = magnitude.contiguous()
     cos_phase = cos_phase.contiguous()
     sin_phase = sin_phase.contiguous()
