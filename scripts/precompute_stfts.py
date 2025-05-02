@@ -496,6 +496,10 @@ def process_files_for_stfts(data_files, target_output_dir, recipe_file, configs,
                 item_mixture_stfts[win_len] = tuple(t[i] for t in batch_mixture_stfts[win_len])
                 item_segment_stfts[win_len] = tuple(t[i] for t in batch_segment_stfts[win_len])
 
+            if i == 0 and batch_idx == 0: # Print only for the very first item once
+                print("DEBUG: Shape of first mixture mag tensor before saving:", item_mixture_stfts[stft_win_lengths[0]][0].shape)
+                print("DEBUG: Shape of first segment mag tensor before saving:", item_segment_stfts[stft_win_lengths[0]][0].shape)
+
             data_to_save = {
                 'stfts': {
                     'mixture': item_mixture_stfts,
