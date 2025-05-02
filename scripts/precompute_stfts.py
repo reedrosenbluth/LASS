@@ -47,6 +47,18 @@ def calculate_stft_components(waveform, n_fft, hop_length, win_length, window, c
     # Output shapes: (batch_size, freq_bins, time_steps)
     magnitude, cos_phase, sin_phase = magphase(real, imag)
 
+    # Squeeze out the unexpected extra dimension from torchlibrosa output
+    magnitude = magnitude.squeeze()
+    cos_phase = cos_phase.squeeze()
+    sin_phase = sin_phase.squeeze()
+    # Handle case where batch size was 1 and got squeezed
+    if magnitude.dim() == 2:
+        magnitude = magnitude.unsqueeze(0)
+        cos_phase = cos_phase.unsqueeze(0)
+        sin_phase = sin_phase.unsqueeze(0)
+    # Tensor should now be (B, F, T) -> 3D
+    assert magnitude.dim() == 3
+
     # Add channel dimension: (batch_size, 1, freq_bins, time_steps)
     magnitude = magnitude.unsqueeze(1) # Shape becomes (B, 1, F, T)
     cos_phase = cos_phase.unsqueeze(1) # Shape becomes (B, 1, F, T)
