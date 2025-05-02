@@ -44,38 +44,15 @@ def calculate_stft_components(waveform, n_fft, hop_length, win_length, window, c
     
     # Calculate magnitude and phase components using the updated magphase function
     # Input shapes: (batch_size, freq_bins, time_steps)
-    # Output shapes: (batch_size, freq_bins, time_steps)
+    # Output shapes from magphase seem to be (B, 1, F, T) in this env
     magnitude, cos_phase, sin_phase = magphase(real, imag)
 
-    # Squeeze out the unexpected extra dimension from torchlibrosa output
-    magnitude = magnitude.squeeze()
-    cos_phase = cos_phase.squeeze()
-    sin_phase = sin_phase.squeeze()
-    # Handle case where batch size was 1 and got squeezed
-    if magnitude.dim() == 2:
-        magnitude = magnitude.unsqueeze(0)
-        cos_phase = cos_phase.unsqueeze(0)
-        sin_phase = sin_phase.unsqueeze(0)
-    # Tensor should now be (B, F, T) -> 3D
-    assert magnitude.dim() == 3
+    # Ensure output is contiguous - return directly as (B, 1, F, T)
+    magnitude = magnitude.contiguous()
+    cos_phase = cos_phase.contiguous()
+    sin_phase = sin_phase.contiguous()
 
-    # Add channel dimension: (batch_size, 1, freq_bins, time_steps)
-    magnitude = magnitude.unsqueeze(1) # Shape becomes (B, 1, F, T)
-    cos_phase = cos_phase.unsqueeze(1) # Shape becomes (B, 1, F, T)
-    sin_phase = sin_phase.unsqueeze(1) # Shape becomes (B, 1, F, T)
-
-    # Permute dimensions to expected (batch, channels, time_steps, freq_bins)
-    # Original indices: 0=B, 1=C, 2=F, 3=T
-    # Target indices:   0=B, 1=C, 3=T, 2=F
-    magnitude_p = magnitude.permute(0, 1, 3, 2)
-    cos_phase_p = cos_phase.permute(0, 1, 3, 2)
-    sin_phase_p = sin_phase.permute(0, 1, 3, 2)
-
-    # Debug print inside the function after permute (optional, can be removed later)
-    # if magnitude.numel() > 0: # Avoid error on empty batch
-    #    print(f"DEBUG: Shape INSIDE func AFTER permute: {magnitude_p.shape}")
-
-    return magnitude_p, cos_phase_p, sin_phase_p
+    return magnitude, cos_phase, sin_phase
 
 def save_batch_precomputed_data(output_dir, batch_index, batch_data_list):
     """
