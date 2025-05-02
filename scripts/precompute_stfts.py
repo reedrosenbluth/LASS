@@ -476,11 +476,15 @@ def process_files_for_stfts(data_files, target_output_dir, recipe_file, configs,
                 mixture_mag, mixture_cos, mixture_sin = calculate_stft_components(
                     mixtures_tensor, **current_stft_params
                 )
+                if batch_idx == 0 and win_length == stft_win_lengths[0]:
+                    print(f"DEBUG: Shape AFTER calculate_stft (mixture mag batch): {mixture_mag.shape}")
                 batch_mixture_stfts[win_length] = (mixture_mag, mixture_cos, mixture_sin)
 
                 segment_mag, segment_cos, segment_sin = calculate_stft_components(
                     segments_tensor, **current_stft_params
                 )
+                if batch_idx == 0 and win_length == stft_win_lengths[0]:
+                    print(f"DEBUG: Shape AFTER calculate_stft (segment mag batch): {segment_mag.shape}")
                 batch_segment_stfts[win_length] = (segment_mag, segment_cos, segment_sin)
 
         # Save individual items from the batch
@@ -497,8 +501,8 @@ def process_files_for_stfts(data_files, target_output_dir, recipe_file, configs,
                 item_segment_stfts[win_len] = tuple(t[i] for t in batch_segment_stfts[win_len])
 
             if i == 0 and batch_idx == 0: # Print only for the very first item once
-                print("DEBUG: Shape of first mixture mag tensor before saving:", item_mixture_stfts[stft_win_lengths[0]][0].shape)
-                print("DEBUG: Shape of first segment mag tensor before saving:", item_segment_stfts[stft_win_lengths[0]][0].shape)
+                print("DEBUG: Shape AFTER slicing (mixture mag item 0):", item_mixture_stfts[stft_win_lengths[0]][0].shape)
+                print("DEBUG: Shape AFTER slicing (segment mag item 0):", item_segment_stfts[stft_win_lengths[0]][0].shape)
 
             data_to_save = {
                 'stfts': {
