@@ -357,103 +357,135 @@ def process_files_for_stfts(data_files, target_output_dir, recipe_file, configs,
     global_item_index_tracker = 0 # Track index based on dataloader iteration
 
     for batch_idx, batch in enumerate(tqdm(dataloader)):
-        waveforms = batch['waveform'].to(device) # Shape: (batch, 1, time)
+        waveforms = batch['waveform'].to(device) # Shape: (B, 1, T)
         texts = batch['text']
-        # Get original audio paths from the batch
-        original_audiopaths = batch['original_audiopath']
+        original_audiopaths = batch['original_audiopath'] # List of B paths
         current_batch_size = waveforms.size(0)
 
         if current_batch_size == 0: continue
 
-        batch_mixtures = []
-        batch_segments = []
+        # --- Vectorized Mixture Creation START ---
+        
+        # 1. Get recipes for the current batch items
         batch_recipes_used = []
-        batch_data_to_save = []
-
-        # Process each item in the batch according to its recipe
+        valid_indices_in_batch = [] # Indices of items in the batch for which recipes were found
         for i in range(current_batch_size):
-            # Use original_audiopath to find the correct recipe
             current_original_path = original_audiopaths[i]
             recipe = recipes_dict.get(current_original_path)
-
             if recipe is None:
-                # This can happen if a file was present during recipe generation but failed
-                # catastrophically (e.g., file deleted) during STFT loading, and its replacement
-                # also happened to be a file whose original path wasn't in the recipes.
                 print(f"Warning: No recipe found for original audio path '{current_original_path}'. Skipping item {i} in batch {batch_idx}.")
                 continue
+            
+            # Basic validation: Ensure primary index in recipe matches current loop index 'i'
+            # This assumes recipes were generated sequentially matching dataloader order.
+            if recipe.get('primary_segment_index_in_batch') != i:
+                 print(f"Warning: Recipe primary index mismatch for item {i} (Path: {current_original_path}). Expected {i}, got {recipe.get('primary_segment_index_in_batch')}. Assuming recipe is correct for this item based on path.")
+                 # We proceed using the recipe found via path, trusting it corresponds to waveform[i]
+                 # Modify recipe's primary index to match current position if needed for consistency downstream?
+                 # Or better, rely solely on the order and 'i'. Let's assume recipe['primary...'] might be misleading if batches differed.
+            
+            batch_recipes_used.append(recipe)
+            valid_indices_in_batch.append(i)
 
-            batch_recipes_used.append(recipe) # Store for saving later
+        if not batch_recipes_used: # If no valid recipes found for this batch
+            global_item_index_tracker += current_batch_size
+            continue
+            
+        # Filter waveforms and recipes to only include valid items
+        valid_waveforms = waveforms[valid_indices_in_batch] # Shape: (B_valid, 1, T)
+        num_valid_items = len(batch_recipes_used)
 
-            # Reconstruct mixture based on recipe
-            primary_segment_index_in_batch = recipe['primary_segment_index_in_batch']
-            # Ensure this matches current position 'i' if recipes were generated sequentially within batches
-            if primary_segment_index_in_batch != i:
-                 print(f"Warning: Recipe primary index in batch ({primary_segment_index_in_batch}) doesn't match current item index in batch ({i}) for global index {i}.")
-                 primary_segment = waveforms[i].clone()
-            else:
-                 primary_segment = waveforms[primary_segment_index_in_batch].clone()
+        # 2. Gather primary segments (these are just the valid waveforms)
+        # The primary segment for the k-th valid item corresponds to valid_waveforms[k]
+        primary_segments = valid_waveforms # Shape: (B_valid, 1, T)
 
-            mix_num = recipe['mix_num'] # Actual number of components used
-            component_indices_in_batch = recipe['component_indices_in_batch'] # Indices within the batch recipe was generated from
+        # 3. Gather and combine noise components
+        # Initialize noise tensor
+        noise_accumulator = torch.zeros_like(primary_segments) # Shape: (B_valid, 1, T)
+        
+        # This part remains tricky to fully vectorize due to variable numbers of components
+        # and the loudness norm needing a reference. We'll loop through valid items,
+        # but perform lookups and norms more directly on tensors.
+        
+        num_noise_components_added = torch.zeros(num_valid_items, device=device) # Track counts per item
 
-            noise = torch.zeros_like(primary_segment)
+        for k, recipe in enumerate(batch_recipes_used):
+            primary_seg_for_norm = primary_segments[k] # Reference for loudness norm (Shape: 1, T)
+            component_indices_in_batch = recipe['component_indices_in_batch']
+            primary_idx_in_orig_batch = valid_indices_in_batch[k] # The original index 'i' for this item
 
-            # Add the other components specified by the recipe
-            num_added_noise = 0
-            for comp_idx_in_batch in component_indices_in_batch:
-                # Skip the primary segment itself when accumulating noise
-                if comp_idx_in_batch == primary_segment_index_in_batch:
+            item_noise = torch.zeros_like(primary_seg_for_norm) # Accumulator for this specific item
+
+            for comp_idx_in_orig_batch in component_indices_in_batch:
+                # Skip the primary segment itself
+                if comp_idx_in_orig_batch == primary_idx_in_orig_batch:
                     continue
 
-                # Check if the component index is valid for the current batch size
-                if comp_idx_in_batch >= current_batch_size:
-                     print(f"Warning: Component index {comp_idx_in_batch} from recipe is out of bounds for current batch size {current_batch_size}. Skipping component for item {i}.")
+                # Check if the component index is valid for the *original* batch size
+                # And if the component index corresponds to an item *with* a valid recipe
+                if comp_idx_in_orig_batch >= current_batch_size or comp_idx_in_orig_batch not in valid_indices_in_batch:
+                     # Find the relative index in the valid batch, if it exists
+                     try:
+                         comp_idx_in_valid_batch = valid_indices_in_batch.index(comp_idx_in_orig_batch)
+                         # If index is valid, but recipe wasn't found, we can't use it.
+                         print(f"Warning: Component index {comp_idx_in_orig_batch} from recipe for item {primary_idx_in_orig_batch} exists in batch but had no valid recipe. Skipping component.")
+                     except ValueError:
+                         # Index is out of bounds for original batch or wasn't loaded.
+                         print(f"Warning: Component index {comp_idx_in_orig_batch} from recipe for item {primary_idx_in_orig_batch} is out of bounds ({current_batch_size}) or was skipped. Skipping component.")
                      continue
 
-                next_segment = waveforms[comp_idx_in_batch]
+                # Get the component waveform using its original index
+                next_segment = waveforms[comp_idx_in_orig_batch] # Shape: (1, T)
 
-                # Apply the loudness normalization logic using the helper
+                # Apply loudness normalization relative to the primary segment of the *current item k*
+                # Note: dynamic_loudnorm expects (1, T) or (T,) input based on its internal rescale
                 rescaled_next_segment = mixer_dynamic_loudnorm(
-                    audio=next_segment, reference=primary_segment, **loudness_params
+                    audio=next_segment, reference=primary_seg_for_norm, **loudness_params
                 )
-                noise += rescaled_next_segment
-                num_added_noise += 1
+                item_noise += rescaled_next_segment
+                num_noise_components_added[k] += 1
 
-            # Normalize the combined noise *if* noise components were added
-            if num_added_noise > 0:
-                 noise = mixer_dynamic_loudnorm(
-                     audio=noise, reference=primary_segment, **loudness_params
+            # Normalize the combined noise for this item *if* components were added
+            if num_noise_components_added[k] > 0:
+                 item_noise = mixer_dynamic_loudnorm(
+                     audio=item_noise, reference=primary_seg_for_norm, **loudness_params
                  )
 
-            # Create mixture
-            mixture = primary_segment + noise
+            noise_accumulator[k] = item_noise # Store accumulated noise for item k
 
-            # Declipping (same logic as SegmentMixer)
-            max_value = torch.max(torch.abs(mixture))
-            if max_value > 1:
-                gain = 0.9 / max_value
-                # Apply gain to both the primary segment *before* mixing and the final mixture
-                # This matches the original SegmentMixer behavior more closely
-                clipped_primary_segment = primary_segment * gain
-                mixture = clipped_primary_segment + (noise * gain) # Re-add noise scaled by same factor
-            else:
-                clipped_primary_segment = primary_segment # No clipping needed
+        # 4. Create Mixtures
+        mixtures = primary_segments + noise_accumulator # Shape: (B_valid, 1, T)
 
+        # 5. De-clipping (Batched)
+        # Find max absolute value per item across the time dimension
+        max_values, _ = torch.max(torch.abs(mixtures.squeeze(1)), dim=1) # Shape: (B_valid,)
+        needs_clipping = max_values > 1.0 # Boolean mask (B_valid,)
+        
+        # Calculate gain per item: 0.9 / max_value if clipping needed, 1.0 otherwise
+        gain = torch.ones_like(max_values) # Shape: (B_valid,)
+        gain[needs_clipping] = 0.9 / max_values[needs_clipping]
+        
+        # Unsqueeze gain to apply to waveforms (B_valid, 1, 1) for broadcasting
+        gain = gain.unsqueeze(-1).unsqueeze(-1)
 
-            batch_mixtures.append(mixture)
-            batch_segments.append(clipped_primary_segment) # Store the primary segment (potentially clipped)
+        # Apply gain to primary segments and mixtures where needed
+        final_segments = primary_segments * gain # Shape: (B_valid, 1, T)
+        final_mixtures = mixtures * gain       # Shape: (B_valid, 1, T)
+        
+        # --- Vectorized Mixture Creation END ---
 
-        if not batch_mixtures: # If no valid mixtures were generated for this batch
+        # Ensure tensors have the expected names for STFT calculation
+        mixtures_tensor = final_mixtures
+        segments_tensor = final_segments
+
+        # Check if any valid items remain after filtering and processing
+        if mixtures_tensor.size(0) == 0:
             global_item_index_tracker += current_batch_size # Still advance tracker
             continue
 
-        # Stack the collected mixtures and segments for batch STFT processing
-        mixtures_tensor = torch.stack(batch_mixtures, dim=0)
-        segments_tensor = torch.stack(batch_segments, dim=0)
-
-        # Compute STFTs for the batch
+        # Compute STFTs for the batch of valid items
         with torch.no_grad():
+            # These dictionaries will store results only for the valid items
             batch_mixture_stfts = {win_len: None for win_len in stft_win_lengths}
             batch_segment_stfts = {win_len: None for win_len in stft_win_lengths}
 
@@ -471,6 +503,7 @@ def process_files_for_stfts(data_files, target_output_dir, recipe_file, configs,
                 mixture_mag, mixture_cos, mixture_sin = calculate_stft_components(
                     mixtures_tensor, **current_stft_params
                 )
+                # Note: Shapes here are (B_valid, 1, T', F)
                 if batch_idx == 0 and win_length == stft_win_lengths[0]:
                     print(f"DEBUG: Shape AFTER calculate_stft (mixture mag batch): {mixture_mag.shape}")
                 batch_mixture_stfts[win_length] = (mixture_mag, mixture_cos, mixture_sin)
@@ -482,20 +515,24 @@ def process_files_for_stfts(data_files, target_output_dir, recipe_file, configs,
                     print(f"DEBUG: Shape AFTER calculate_stft (segment mag batch): {segment_mag.shape}")
                 batch_segment_stfts[win_length] = (segment_mag, segment_cos, segment_sin)
 
-        # Save individual items from the batch
-        num_items_in_batch_processed = mixtures_tensor.size(0) # Use actual number processed
-        for i in range(num_items_in_batch_processed):
-            recipe_for_item = batch_recipes_used[i] # Get recipe corresponding to this processed item
-            item_output_index = recipe_for_item['output_index'] # Get the correct global index
+        # Prepare data for saving (loop through the *valid* items processed)
+        batch_data_to_save = []
+        num_items_in_batch_processed = mixtures_tensor.size(0) # Number of valid items
+
+        for k in range(num_items_in_batch_processed): # Loop index 'k' corresponds to valid items
+            recipe_for_item = batch_recipes_used[k] # Get recipe corresponding to this processed item
+            item_output_index = recipe_for_item['output_index'] # Get the correct global index from the recipe
 
             item_mixture_stfts = {}
             item_segment_stfts = {}
             for win_len in stft_win_lengths:
-                # Slice the i-th item from the batch results
-                item_mixture_stfts[win_len] = tuple(t[i] for t in batch_mixture_stfts[win_len])
-                item_segment_stfts[win_len] = tuple(t[i] for t in batch_segment_stfts[win_len])
+                # Slice the k-th item from the batch results
+                # Input tensors are (B_valid, 1, T', F) -> Slice to (1, T', F)
+                item_mixture_stfts[win_len] = tuple(t[k] for t in batch_mixture_stfts[win_len])
+                item_segment_stfts[win_len] = tuple(t[k] for t in batch_segment_stfts[win_len])
 
-            if i == 0 and batch_idx == 0: # Print only for the very first item once
+            if k == 0 and batch_idx == 0: # Print only for the very first item once
+                # Shape should be (1, T', F)
                 print("DEBUG: Shape AFTER slicing (mixture mag item 0):", item_mixture_stfts[stft_win_lengths[0]][0].shape)
                 print("DEBUG: Shape AFTER slicing (segment mag item 0):", item_segment_stfts[stft_win_lengths[0]][0].shape)
 
@@ -508,21 +545,21 @@ def process_files_for_stfts(data_files, target_output_dir, recipe_file, configs,
                 'mixture_component_texts': recipe_for_item['mixture_component_texts'], # List of all component texts
                 'stft_common_params': common_stft_params_for_saving,
                 'stft_win_lengths': stft_win_lengths
+                # 'output_index': item_output_index # Could add for debugging, but not needed for saving format
             }
-            # Use item_output_index for consistent file naming
-            #save_precomputed_data(target_output_dir, item_output_index, data_to_save) # REMOVED
             batch_data_to_save.append(data_to_save) # Append data for batch saving
-            #processed_count_for_set += 1 # Increment based on actual items saved # MOVED outside loop
 
         # Save the collected batch data
         if batch_data_to_save:
             items_saved_count = save_batch_precomputed_data(target_output_dir, batch_idx, batch_data_to_save)
             processed_count_for_set += items_saved_count # Increment count by number actually saved
-
-        global_item_index_tracker += current_batch_size # Advance tracker by processed batch size
+        
+        # Advance tracker by the original batch size, as dataloader moves forward
+        global_item_index_tracker += current_batch_size
 
     if processed_count_for_set != len(recipes_dict):
-        print(f"Warning: Number of processed items ({processed_count_for_set}) does not match number of recipes ({len(recipes_dict)}).")
+        # This warning might trigger more often if items are skipped due to missing recipes.
+        print(f"Warning: Number of processed items ({processed_count_for_set}) does not match number of recipes ({len(recipes_dict)}). This might be due to skipped items.")
 
     dropped_count_stft = dataset.get_dropped_count()
     if dropped_count_stft > 0:
