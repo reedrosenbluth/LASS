@@ -47,15 +47,26 @@ def calculate_stft_components(waveform, n_fft, hop_length, win_length, window, c
     # Output shapes: (batch_size, freq_bins, time_steps)
     magnitude, cos_phase, sin_phase = magphase(real, imag)
 
+    # Explicitly remove any unexpected dimensions before adding the channel
+    # Ensure shape is (B, F, T) before unsqueeze
+    magnitude = magnitude.squeeze()
+    cos_phase = cos_phase.squeeze()
+    sin_phase = sin_phase.squeeze()
+    if magnitude.dim() == 2: # If squeeze removed batch dim (batch size 1), re-add it
+        magnitude = magnitude.unsqueeze(0)
+        cos_phase = cos_phase.unsqueeze(0)
+        sin_phase = sin_phase.unsqueeze(0)
+    assert magnitude.dim() == 3 # Should now be (B, F, T)
+
     # Add channel dimension: (batch_size, 1, freq_bins, time_steps)
-    magnitude = magnitude.unsqueeze(1)
-    cos_phase = cos_phase.unsqueeze(1)
-    sin_phase = sin_phase.unsqueeze(1)
+    magnitude = magnitude.unsqueeze(1) # Shape becomes (B, 1, F, T)
+    cos_phase = cos_phase.unsqueeze(1) # Shape becomes (B, 1, F, T)
+    sin_phase = sin_phase.unsqueeze(1) # Shape becomes (B, 1, F, T)
 
     # Transpose to expected (batch, channels, time_steps, freq_bins)
-    magnitude = magnitude.transpose(-1, -2)
-    cos_phase = cos_phase.transpose(-1, -2)
-    sin_phase = sin_phase.transpose(-1, -2)
+    magnitude = magnitude.transpose(-1, -2) # Should swap F and T -> (B, 1, T, F)
+    cos_phase = cos_phase.transpose(-1, -2) # Should swap F and T -> (B, 1, T, F)
+    sin_phase = sin_phase.transpose(-1, -2) # Should swap F and T -> (B, 1, T, F)
 
     return magnitude, cos_phase, sin_phase
 
