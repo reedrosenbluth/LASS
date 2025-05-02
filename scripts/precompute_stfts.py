@@ -59,14 +59,14 @@ def calculate_stft_components(waveform, n_fft, hop_length, win_length, window, c
 
     return magnitude, cos_phase, sin_phase
 
-def save_precomputed_data(output_dir, index, data_dict):
+def save_batch_precomputed_data(output_dir, batch_index, batch_data_list):
     """
-    Saves the precomputed STFT data, text, and potentially mixture component texts
-    for a single item, ensuring tensors are on CPU.
+    Saves the precomputed STFT data for a whole batch to a single file,
+    ensuring tensors are on CPU.
 
     Output File Format (`.pt`):
-    Each file contains a dictionary with the following structure:
-    {
+    Each file contains a list of dictionaries with the following structure:
+    [{
         'stfts': {
             'mixture': {
                 <win_len_1>: (mag_tensor, cos_tensor, sin_tensor),
@@ -81,32 +81,48 @@ def save_precomputed_data(output_dir, index, data_dict):
         'mixture_component_texts': List[str], # Captions of all segments in the mixture (including primary)
         'stft_common_params': { ... },
         'stft_win_lengths': List[int]
-    }
+    }]
     """
-    filename = output_dir / f"item_{index:09d}.pt"
-    # Detach and move tensors to CPU before saving
-    cpu_data_dict = {}
-    for key, value in data_dict.items():
-        if key == 'stfts' and isinstance(value, dict): # Handle nested STFT dict
-            cpu_stfts = {}
-            for source_type, stft_results in value.items(): # mixture, segment
-                cpu_stfts[source_type] = {}
-                for win_len, stft_tuple in stft_results.items():
-                    if isinstance(stft_tuple, tuple):
-                        # Ensure tensors are detached and moved to CPU
-                        cpu_stfts[source_type][win_len] = tuple(t.detach().cpu() for t in stft_tuple if isinstance(t, torch.Tensor))
-                    else: # Should not happen, but handle just in case
-                         cpu_stfts[source_type][win_len] = stft_tuple
-            cpu_data_dict[key] = cpu_stfts
-        elif isinstance(value, torch.Tensor):
-             # Handle potential standalone tensors if added later
-            cpu_data_dict[key] = value.detach().cpu()
-        else:
-            # Keep non-tensor data as is (e.g., text, lists, dicts of primitives)
-            cpu_data_dict[key] = value # Handles text, stft_common_params, stft_win_lengths, mixture_component_texts
+    if not batch_data_list:
+        # This might happen if a batch had items, but all were skipped due to recipe issues.
+        print(f"Warning: Attempting to save empty data list for batch {batch_index}. Skipping file creation.")
+        return 0 # Indicate 0 items saved
 
-    torch.save(cpu_data_dict, filename)
+    filename = output_dir / f"batch_{batch_index:06d}.pt"
+    batch_cpu_data_list = []
 
+    for data_dict in batch_data_list:
+        # Reuse the CPU conversion logic, applied to each item's dict
+        cpu_data_dict = {}
+        for key, value in data_dict.items():
+            if key == 'stfts' and isinstance(value, dict):
+                cpu_stfts = {}
+                for source_type, stft_results in value.items():
+                    cpu_stfts[source_type] = {}
+                    for win_len, stft_tuple in stft_results.items():
+                        if isinstance(stft_tuple, tuple):
+                            # Ensure tensors are detached and moved to CPU
+                            cpu_stfts[source_type][win_len] = tuple(t.detach().cpu() for t in stft_tuple if isinstance(t, torch.Tensor))
+                        else: # Should not happen, but handle just in case
+                             cpu_stfts[source_type][win_len] = stft_tuple
+                cpu_data_dict[key] = cpu_stfts
+            elif isinstance(value, torch.Tensor):
+                 # Handle potential standalone tensors if added later
+                cpu_data_dict[key] = value.detach().cpu()
+            else:
+                # Keep non-tensor data as is (e.g., text, lists, dicts of primitives)
+                cpu_data_dict[key] = value # Handles text, stft_common_params, stft_win_lengths, mixture_component_texts
+        batch_cpu_data_list.append(cpu_data_dict)
+
+    try:
+        torch.save(batch_cpu_data_list, filename)
+        # print(f"Saved batch {batch_index} ({len(batch_cpu_data_list)} items) to {filename}") # Optional: More verbose logging
+        return len(batch_cpu_data_list) # Return number of items saved
+    except Exception as e:
+        print(f"Error saving batch {batch_index} to {filename}: {e}")
+        # Decide how to handle error: raise? continue? log?
+        # For now, let's print and return 0 items saved for this batch
+        return 0
 
 def generate_mixture_recipes_for_batch(texts, max_mix_num, batch_size):
     """
@@ -350,6 +366,7 @@ def process_files_for_stfts(data_files, target_output_dir, recipe_file, configs,
         batch_mixtures = []
         batch_segments = []
         batch_recipes_used = []
+        batch_data_to_save = []
 
         # Process each item in the batch according to its recipe
         for i in range(current_batch_size):
@@ -483,8 +500,14 @@ def process_files_for_stfts(data_files, target_output_dir, recipe_file, configs,
                 'stft_win_lengths': stft_win_lengths
             }
             # Use item_output_index for consistent file naming
-            save_precomputed_data(target_output_dir, item_output_index, data_to_save)
-            processed_count_for_set += 1 # Increment based on actual items saved
+            #save_precomputed_data(target_output_dir, item_output_index, data_to_save) # REMOVED
+            batch_data_to_save.append(data_to_save) # Append data for batch saving
+            #processed_count_for_set += 1 # Increment based on actual items saved # MOVED outside loop
+
+        # Save the collected batch data
+        if batch_data_to_save:
+            items_saved_count = save_batch_precomputed_data(target_output_dir, batch_idx, batch_data_to_save)
+            processed_count_for_set += items_saved_count # Increment count by number actually saved
 
         global_item_index_tracker += current_batch_size # Advance tracker by processed batch size
 
