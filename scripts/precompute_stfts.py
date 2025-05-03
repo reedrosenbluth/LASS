@@ -6,6 +6,8 @@ from tqdm import tqdm
 import pathlib
 import json
 import random
+import threading
+import queue
 from torch.utils.data import DataLoader
 from torchlibrosa.stft import STFT, magphase
 
@@ -118,6 +120,25 @@ def save_batch_precomputed_data(output_dir, batch_index, batch_data_list):
         # Decide how to handle error: raise? continue? log?
         # For now, let's print and return 0 items saved for this batch
         return 0
+
+def _save_worker(q, pbar=None):
+    """Worker function to save data from a queue."""
+    while True:
+        item = q.get()
+        if item is None: # Sentinel value to signal termination
+            q.task_done()
+            break
+        try:
+            filename, data_list = item
+            num_items = len(data_list)
+            torch.save(data_list, filename)
+            if pbar:
+                pbar.update(num_items) # Update progress bar based on items saved
+            # print(f"Saved {num_items} items to {filename}") # Optional debug
+        except Exception as e:
+            print(f"Error saving batch to {filename}: {e}")
+        finally:
+            q.task_done() # Signal that this task is done
 
 def generate_mixture_recipes_for_batch(texts, original_audiopaths, max_mix_num, batch_size):
     """
@@ -311,21 +332,43 @@ def process_files_for_stfts(data_files, target_output_dir, recipe_file, configs,
     print(f"Output directory: {target_output_dir}")
     target_output_dir.mkdir(parents=True, exist_ok=True)
 
+    # --- Setup Saving Thread ---
+    save_queue = queue.Queue(maxsize=10) # Limit queue size to prevent excessive memory use
+    # Create a tqdm instance for saving progress, total needs to be set later
+    save_pbar = tqdm(total=0, desc="Saving Batches", unit="item", position=1, leave=False)
+    save_thread = threading.Thread(target=_save_worker, args=(save_queue, save_pbar), daemon=True)
+    save_thread.start()
+    # ---------------------------
+
     print(f"Loading recipes from {recipe_file}...")
     try:
         with open(recipe_file, 'r') as f:
             recipes = json.load(f)
         if not recipes:
              print("Recipe file is empty. Nothing to process.")
+             # Need to ensure thread is handled even if returning early
+             save_queue.put(None)
+             save_thread.join()
+             save_pbar.close()
              return 0
-        # Create a dictionary mapping original_audiopath to recipe
+         # Create a dictionary mapping original_audiopath to recipe
         recipes_dict = {recipe['original_audiopath']: recipe for recipe in recipes}
         print(f"Loaded {len(recipes_dict)} recipes, indexed by original audio path.")
+        # Set the total for the save progress bar
+        save_pbar.total = len(recipes_dict)
     except FileNotFoundError:
         print(f"Error: Recipe file not found at {recipe_file}")
+        # Ensure thread cleanup on error too
+        save_queue.put(None)
+        save_thread.join()
+        save_pbar.close()
         raise
     except json.JSONDecodeError:
         print(f"Error: Could not decode JSON from recipe file: {recipe_file}")
+        # Ensure thread cleanup on error too
+        save_queue.put(None)
+        save_thread.join()
+        save_pbar.close()
         raise
 
     sampling_rate = configs['data']['sampling_rate']
@@ -556,13 +599,45 @@ def process_files_for_stfts(data_files, target_output_dir, recipe_file, configs,
             }
             batch_data_to_save.append(data_to_save) # Append data for batch saving
 
-        # Save the collected batch data
+        # Save the collected batch data asynchronously
         if batch_data_to_save:
-            items_saved_count = save_batch_precomputed_data(target_output_dir, batch_idx, batch_data_to_save)
-            processed_count_for_set += items_saved_count # Increment count by number actually saved
-        
+            # Move data to CPU before putting it on the queue
+            batch_cpu_data_list = []
+            for data_dict in batch_data_to_save:
+                cpu_data_dict = {}
+                for key, value in data_dict.items():
+                    if key == 'stfts' and isinstance(value, dict):
+                        cpu_stfts = {}
+                        for source_type, stft_results in value.items():
+                            cpu_stfts[source_type] = {}
+                            for win_len, stft_tuple in stft_results.items():
+                                if isinstance(stft_tuple, tuple):
+                                    cpu_stfts[source_type][win_len] = tuple(t.detach().cpu() for t in stft_tuple if isinstance(t, torch.Tensor))
+                                else:
+                                    cpu_stfts[source_type][win_len] = stft_tuple
+                        cpu_data_dict[key] = cpu_stfts
+                    elif isinstance(value, torch.Tensor):
+                        cpu_data_dict[key] = value.detach().cpu()
+                    else:
+                        cpu_data_dict[key] = value
+                batch_cpu_data_list.append(cpu_data_dict)
+
+            # Generate filename and put data on the queue
+            filename = target_output_dir / f"batch_{batch_idx:06d}.pt"
+            save_queue.put((filename, batch_cpu_data_list))
+            processed_count_for_set += len(batch_cpu_data_list) # Increment count by number prepared for saving
+
         # Advance tracker by the original batch size, as dataloader moves forward
         global_item_index_tracker += current_batch_size
+
+    # --- Wait for saving thread to finish --- 
+    print("Waiting for all save operations to complete...")
+    save_queue.put(None) # Signal the worker to terminate
+    save_queue.join() # Wait for the queue to become empty
+    save_thread.join() # Wait for the thread to actually finish
+    save_pbar.close() # Close the saving progress bar
+    print("Saving thread finished.")
+    # ----------------------------------------
 
     if processed_count_for_set != len(recipes_dict):
         # This warning might trigger more often if items are skipped due to missing recipes.
