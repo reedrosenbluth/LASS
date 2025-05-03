@@ -404,7 +404,8 @@ def process_files_for_stfts(data_files, target_output_dir, recipe_file, configs,
         batch_size=effective_batch_size,
         shuffle=False,
         num_workers=num_workers,
-        collate_fn=None
+        collate_fn=None,
+        pin_memory=True
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
