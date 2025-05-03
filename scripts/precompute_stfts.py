@@ -438,8 +438,8 @@ def process_files_for_stfts(data_files, target_output_dir, recipe_file, configs,
             
             # Basic validation: Ensure primary index in recipe matches current loop index 'i'
             # This assumes recipes were generated sequentially matching dataloader order.
-            if recipe.get('primary_segment_index_in_batch') != i:
-                 print(f"Warning: Recipe primary index mismatch for item {i} (Path: {current_original_path}). Expected {i}, got {recipe.get('primary_segment_index_in_batch')}. Assuming recipe is correct for this item based on path.")
+            # if recipe.get('primary_segment_index_in_batch') != i:
+            #      print(f"Warning: Recipe primary index mismatch for item {i} (Path: {current_original_path}). Expected {i}, got {recipe.get('primary_segment_index_in_batch')}. Assuming recipe is correct for this item based on path.")
                  # We proceed using the recipe found via path, trusting it corresponds to waveform[i]
                  # Modify recipe's primary index to match current position if needed for consistency downstream?
                  # Or better, rely solely on the order and 'i'. Let's assume recipe['primary...'] might be misleading if batches differed.
@@ -563,7 +563,7 @@ def process_files_for_stfts(data_files, target_output_dir, recipe_file, configs,
                 mixture_mag, mixture_cos, mixture_sin = calculate_stft_components(
                     mixtures_tensor, **current_stft_params
                 )
-                # Note: Shapes here are (B_valid, 1, T', F)
+                # Store mixture STFT tuple (mag, cos, sin)
                 batch_mixture_stfts[win_length] = (mixture_mag, mixture_cos, mixture_sin)
 
                 segment_mag, segment_cos, segment_sin = calculate_stft_components(
@@ -578,20 +578,23 @@ def process_files_for_stfts(data_files, target_output_dir, recipe_file, configs,
         for k in range(num_items_in_batch_processed): # Loop index 'k' corresponds to valid items
             recipe_for_item = batch_recipes_used[k] # Get recipe corresponding to this processed item
             item_output_index = recipe_for_item['output_index'] # Get the correct global index from the recipe
+            target_waveform_for_item = segments_tensor[k] # Get the corresponding target waveform (B_valid, 1, T)
 
             item_mixture_stfts = {}
             item_segment_stfts = {}
             for win_len in stft_win_lengths:
                 # Slice the k-th item from the batch results
-                # Input tensors are (B_valid, 1, T', F) -> Slice to (1, T', F)
-                item_mixture_stfts[win_len] = tuple(t[k] for t in batch_mixture_stfts[win_len])
-                item_segment_stfts[win_len] = tuple(t[k] for t in batch_segment_stfts[win_len])
+                # Input tensors are (B_valid, 1, T', F) -> Slice to (1, 1, T', F)
+                # Let's keep the channel dim for consistency
+                item_mixture_stfts[win_len] = tuple(t[k:k+1] for t in batch_mixture_stfts[win_len])
+                item_segment_stfts[win_len] = tuple(t[k:k+1] for t in batch_segment_stfts[win_len])
 
             data_to_save = {
                 'stfts': {
-                    'mixture': item_mixture_stfts,
-                    'segment': item_segment_stfts # STFT of the primary segment
+                    'mixture': item_mixture_stfts, # Dict[win_len, Tuple[Tensor(1,1,T,F)]]
+                    'segment': item_segment_stfts  # Dict[win_len, Tuple[Tensor(1,1,T,F)]]
                 },
+                'target_waveform': target_waveform_for_item, # Add waveform Tensor(1, 1, T)
                 'text': recipe_for_item['primary_segment_text'], # Text of primary segment
                 'mixture_component_texts': recipe_for_item['mixture_component_texts'], # List of all component texts
                 'stft_common_params': common_stft_params_for_saving,
@@ -613,11 +616,15 @@ def process_files_for_stfts(data_files, target_output_dir, recipe_file, configs,
                             cpu_stfts[source_type] = {}
                             for win_len, stft_tuple in stft_results.items():
                                 if isinstance(stft_tuple, tuple):
+                                    # Ensure tensors are detached and moved to CPU
                                     cpu_stfts[source_type][win_len] = tuple(t.detach().cpu() for t in stft_tuple if isinstance(t, torch.Tensor))
-                                else:
-                                    cpu_stfts[source_type][win_len] = stft_tuple
+                                else: # Should not happen, but handle just in case
+                                     cpu_stfts[source_type][win_len] = stft_tuple
                         cpu_data_dict[key] = cpu_stfts
+                    elif isinstance(value, torch.Tensor) and key == 'target_waveform': # Handle waveform tensor
+                        cpu_data_dict[key] = value.detach().cpu()
                     elif isinstance(value, torch.Tensor):
+                         # Handle potential standalone tensors if added later
                         cpu_data_dict[key] = value.detach().cpu()
                     else:
                         cpu_data_dict[key] = value
