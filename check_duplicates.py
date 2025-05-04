@@ -41,33 +41,41 @@ def check_duplicates(file_paths, split_label):
 
         try:
             with open(file_path, 'r') as f:
-                data = json.load(f)
+                loaded_json = json.load(f) # Load the whole JSON object first
             files_processed += 1
 
-            if not isinstance(data, list):
-                print(f"Warning: Expected a list in {file_path}, but got {type(data)}. Skipping file.")
+            # Extract the list of entries
+            entries_list = None
+            if isinstance(loaded_json, list):
+                entries_list = loaded_json # It's already a list
+            elif isinstance(loaded_json, dict) and 'data' in loaded_json and isinstance(loaded_json['data'], list):
+                entries_list = loaded_json['data'] # Extract the list from the 'data' key
+            else:
+                print(f"Warning: Expected a list or a dict with a 'data' key containing a list in {file_path}, but got {type(loaded_json)}. Skipping file.")
                 files_failed += 1
                 continue
 
-            if not data:
-                print(f"Info: File {file_path} is empty.")
+            # Use entries_list from here onwards
+            if not entries_list:
+                print(f"Info: File {file_path} has an empty 'data' list or is an empty list.")
                 continue # Skip empty files
 
             # Determine audio path key if not already found
             if not checked_first_entry:
-                for entry in data: # Find the first valid entry to determine the key
+                for entry in entries_list: # Find the first valid entry to determine the key
                      if isinstance(entry, dict):
                          audio_key_name = find_audio_path_key(entry)
                          if audio_key_name:
-                             print(f"Detected audio path key: '{audio_key_name}'")
+                             print(f"Detected audio path key: '{audio_key_name}' (using key '{audio_key_name}' based on {file_path.name})") # Use detected key
                              checked_first_entry = True
                              break
                 if not checked_first_entry:
-                     print(f"Warning: Could not determine audio path key from first file {file_path}. Will try common keys for each entry.")
+                     # This case is less likely now if the file structure is consistent, but keep as fallback
+                     print(f"Warning: Could not determine audio path key from first non-empty file {file_path}. Will try common keys for each entry.")
                      # Keep checked_first_entry False
 
             # Process entries
-            for entry in data:
+            for entry in entries_list:
                 total_entries += 1
                 if not isinstance(entry, dict):
                     print(f"Warning: Skipping non-dictionary item in {file_path}: {entry}")
@@ -77,15 +85,20 @@ def check_duplicates(file_paths, split_label):
                 if not current_audio_key: # If not determined globally, try per entry
                     current_audio_key = find_audio_path_key(entry)
 
+                # Use 'wav' as the specific key based on user example if detection failed
+                if not current_audio_key:
+                     current_audio_key = 'wav' # Fallback to 'wav' based on example
+
                 if current_audio_key and current_audio_key in entry:
                     audio_path = entry[current_audio_key]
                     # Normalize path? (Optional, depends on how paths are stored)
-                    # audio_path = str(pathlib.Path(audio_path).resolve()) # Example normalization
+                    # Example: Resolve relative paths if necessary or make consistent
+                    # audio_path = str(pathlib.Path(audio_path).resolve())
                     all_paths.append(audio_path)
                     path_counts[audio_path] += 1
                     path_locations[audio_path].add(str(file_path.name))
                 else:
-                    print(f"Warning: Could not find audio path key ({audio_key_name or 'any common key'}) in entry in {file_path}: {list(entry.keys())}")
+                    print(f"Warning: Could not find audio path key ({audio_key_name or current_audio_key or 'any common key'}) in entry in {file_path}: {list(entry.keys())}")
                     entries_missing_key += 1
 
 
