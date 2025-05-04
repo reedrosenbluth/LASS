@@ -72,15 +72,22 @@ class AudioTextDataset(Dataset):
             self.dropped_files_count += 1
             if not self.suppress_warnings:
                 # Use original_path for error message context
-                print(f'Error: {e} occurred when loading {original_path} (intended item index {index}). Replacing with random item.')
-            random_index = random.randint(0, len(self.all_data_json)-1)
-            # Pass the original_path down the recursive call
-            return self._read_audio(index=random_index, original_path=original_path)
+                print(f'Error: {e} occurred when loading {original_path} (intended item index {index}). Skipping this item.')
+            # Return None to signal failure
+            return None
 
     def __getitem__(self, index):
         # create a audio tensor
-        # Capture original_path returned by _read_audio
-        text, audio_data, audio_rate, original_path = self._read_audio(index)
+        # Capture the result from _read_audio
+        read_result = self._read_audio(index)
+
+        # Check if loading failed
+        if read_result is None:
+            return None # Propagate the failure signal
+
+        # Unpack if successful
+        text, audio_data, audio_rate, original_path = read_result
+
         audio_len = audio_data.shape[1] / audio_rate
         # convert stero to single channel
         if audio_data.shape[0] > 1:
