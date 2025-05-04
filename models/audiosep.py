@@ -15,7 +15,6 @@ class AudioSep(pl.LightningModule, PyTorchModelHubMixin):
     def __init__(
         self,
         ss_model: nn.Module = None,
-        waveform_mixer = None,
         query_encoder: nn.Module = CLAP_Encoder().eval(),
         loss_function = None,
         optimizer_type: str = None,
@@ -28,7 +27,7 @@ class AudioSep(pl.LightningModule, PyTorchModelHubMixin):
 
         Args:
             ss_model: nn.Module
-            anchor_segment_detector: nn.Module
+            query_encoder: nn.Module
             loss_function: function or object
             learning_rate: float
             lr_lambda: function
@@ -36,7 +35,6 @@ class AudioSep(pl.LightningModule, PyTorchModelHubMixin):
 
         super().__init__()
         self.ss_model = ss_model
-        self.waveform_mixer = waveform_mixer
         self.query_encoder = query_encoder
         self.query_encoder_type = self.query_encoder.encoder_type
         self.use_text_ratio = use_text_ratio
@@ -56,10 +54,16 @@ class AudioSep(pl.LightningModule, PyTorchModelHubMixin):
 
         Args:
             batch_data_dict: e.g. 
-                'audio_text': {
-                    'text': ['a sound of dog', ...]
-                    'waveform': (batch_size, 1, samples)
-            }
+                'text': ['a sound of dog', ...]
+                'stfts': {
+                    'mixture': {
+                        win_len: (batch_size, 1, T, F)
+                    },
+                    'segment': {
+                        win_len: (batch_size, 1, T, F)
+                    }
+                }
+                'stft_win_lengths': [List[int]]
             batch_idx: int
 
         Returns:
@@ -68,44 +72,51 @@ class AudioSep(pl.LightningModule, PyTorchModelHubMixin):
         # [important] fix random seeds across devices
         random.seed(batch_idx)
 
-        batch_audio_text_dict = batch_data_dict['audio_text']
+        batch_text = batch_data_dict['text']
+        batch_stfts = batch_data_dict['stfts']
+        stft_win_lengths = batch_data_dict['stft_win_lengths']
+        target_waveforms = batch_data_dict['target_waveform']
+        selected_win_len = stft_win_lengths[0]
 
-        batch_text = batch_audio_text_dict['text']
-        batch_audio = batch_audio_text_dict['waveform']
-        device = batch_audio.device
-        
-        mixtures, segments = self.waveform_mixer(
-            waveforms=batch_audio
-        )
+        try:
+            mixture_mag = batch_stfts['mixture'][selected_win_len][0]
+            mixture_cos = batch_stfts['mixture'][selected_win_len][1]
+            mixture_sin = batch_stfts['mixture'][selected_win_len][2]
+        except (KeyError, TypeError, IndexError) as e:
+            print(f"Error accessing STFT data: {e}")
+            print(f"Selected window length: {selected_win_len}")
+            print("Batch STFT structure received:", batch_data_dict.get('stfts'))
+            raise ValueError("Could not extract STFTs from batch. Check DataLoader collation and PrecomputedSTFTDataset output format.") from e
 
-        # calculate text embed for audio-text data
+        device = mixture_mag.device
+
         if self.query_encoder_type == 'CLAP':
             conditions = self.query_encoder.get_query_embed(
-                modality='hybird',
+                modality='text',
                 text=batch_text,
-                audio=segments.squeeze(1),
-                use_text_ratio=self.use_text_ratio,
             )
+        else:
+            raise NotImplementedError(f"Query encoder type {self.query_encoder_type} not fully handled with STFT input.")
 
         input_dict = {
-            'mixture': mixtures[:, None, :].squeeze(1),
+            'stft_mixture_mag': mixture_mag,
+            'stft_mixture_cos': mixture_cos,
+            'stft_mixture_sin': mixture_sin,
             'condition': conditions,
         }
 
         target_dict = {
-            'segment': segments.squeeze(1),
+            'waveform': target_waveforms.squeeze(1),
         }
 
         self.ss_model.train()
-        sep_segment = self.ss_model(input_dict)['waveform']
-        sep_segment = sep_segment.squeeze()
-        # (batch_size, 1, segment_samples)
+        sep_waveform = self.ss_model(input_dict)['waveform']
+        sep_waveform = sep_waveform.squeeze(1)
 
         output_dict = {
-            'segment': sep_segment,
+            'waveform': sep_waveform,
         }
 
-        # Calculate loss.
         loss = self.loss_function(output_dict, target_dict)
 
         self.log_dict({"train_loss": loss})

@@ -8,11 +8,11 @@ from lightning.pytorch.strategies import DDPStrategy
 from lightning.pytorch.loggers import WandbLogger
 from torch.utils.tensorboard import SummaryWriter
 from data.datamodules import *
+from data.precomputed_stft_dataset import PrecomputedSTFTDataset
 from utils import create_logging, parse_yaml
 from models.resunet import *
 from losses import get_loss_function
 from models.audiosep import AudioSep, get_model_class
-from data.waveform_mixers import SegmentMixer
 from models.clap_encoder import CLAP_Encoder
 from callbacks.base import CheckpointEveryNSteps
 from optimizers.lr_schedulers import get_lr_lambda
@@ -114,23 +114,28 @@ def get_data_module(
 
     # read configurations
     configs = parse_yaml(config_yaml)
-    sampling_rate = configs['data']['sampling_rate']
-    segment_seconds = configs['data']['segment_seconds']
-    
-    # audio-text datasets
-    datafiles = configs['data']['datafiles']
-    
-    # dataset
-    dataset = AudioTextDataset(
-        datafiles=datafiles, 
-        sampling_rate=sampling_rate, 
-        max_clip_len=segment_seconds,
+    precomputed_stft_dir = configs['data'].get('precomputed_stft_dir', None)
+
+    logging.info("Using precomputed STFT dataset.")
+    if not precomputed_stft_dir:
+        raise ValueError("Config key 'data.precomputed_stft_dir' must be set.")
+
+    # Assuming precomputed data has 'train' and 'val' subdirectories
+    # The current DataModule structure seems geared towards a single train_dataset.
+    # If validation is handled by DataModule splitting or not used, we just need the train path.
+    # TODO: Confirm how validation data is handled by DataModule and load val set if needed.
+    precomputed_train_dir = pathlib.Path(precomputed_stft_dir) / "train"
+    logging.info(f"Loading precomputed training data from: {precomputed_train_dir}")
+
+    # Instantiate the precomputed dataset for training
+    dataset = PrecomputedSTFTDataset(
+        data_dir=str(precomputed_train_dir),
+        # Optionally add expected_num_items if known/needed
     )
-    
-    
+
     # data module
     data_module = DataModule(
-        train_dataset=dataset,
+        train_dataset=dataset, # Always use the precomputed dataset
         num_workers=num_workers,
         batch_size=batch_size
     )
@@ -155,12 +160,6 @@ def train(args) -> NoReturn:
     devices_num = torch.cuda.device_count()
     # Read config file.
     configs = parse_yaml(config_yaml)
-
-    # Configuration of data
-    max_mix_num = configs['data']['max_mix_num']
-    sampling_rate = configs['data']['sampling_rate']
-    lower_db = configs['data']['loudness_norm']['lower_db']
-    higher_db = configs['data']['loudness_norm']['higher_db']
 
     # Configuration of the separation model
     query_net = configs['model']['query_net']
@@ -214,11 +213,9 @@ def train(args) -> NoReturn:
     # loss function
     loss_function = get_loss_function(loss_type)
 
-    segment_mixer = SegmentMixer(
-        max_mix_num=max_mix_num,
-        lower_db=lower_db, 
-        higher_db=higher_db
-    )
+    # SegmentMixer is no longer needed as mixing/STFT is precomputed
+    segment_mixer = None 
+    logging.info("SegmentMixer skipped as precomputed STFTs are used.")
 
     
     if query_net == 'CLAP':
@@ -235,13 +232,12 @@ def train(args) -> NoReturn:
     # pytorch-lightning model
     pl_model = AudioSep(
         ss_model=ss_model,
-        waveform_mixer=segment_mixer,
         query_encoder=query_encoder,
         loss_function=loss_function,
         optimizer_type=optimizer_type,
         learning_rate=learning_rate,
         lr_lambda_func=lr_lambda_func,
-        use_text_ratio=use_text_ratio
+        use_text_ratio=use_text_ratio,
     )
 
     checkpoint_every_n_steps = CheckpointEveryNSteps(
