@@ -258,7 +258,6 @@ def process_files_for_recipes(data_files, target_recipe_file, configs):
     max_clip_len = configs['data']['segment_seconds']
     max_mix_num = configs['data']['max_mix_num']
     batch_size = configs['train']['batch_size_per_device']
-    num_workers = configs['train']['num_workers']
 
     print("Initializing dataset...")
     dataset = AudioTextDataset(
@@ -285,7 +284,7 @@ def process_files_for_recipes(data_files, target_recipe_file, configs):
         dataset,
         batch_size=effective_batch_size,
         shuffle=False, # Must be False for recipes to match Phase 2 order
-        num_workers=num_workers,
+        num_workers=0,
         collate_fn=safe_collate # Use the safe collate function
     )
 
@@ -402,7 +401,6 @@ def process_files_for_stfts(data_files, target_output_dir, recipe_file, configs,
     lower_db = configs['data']['loudness_norm']['lower_db']
     higher_db = configs['data']['loudness_norm']['higher_db']
     batch_size = configs['train']['batch_size_per_device']
-    num_workers = configs['train']['num_workers']
 
     stft_hop_length = configs['data']['stft_hop_length']
     stft_window = configs['data']['stft_window']
@@ -429,7 +427,7 @@ def process_files_for_stfts(data_files, target_output_dir, recipe_file, configs,
         dataset,
         batch_size=effective_batch_size,
         shuffle=False,
-        num_workers=num_workers,
+        num_workers=0,
         collate_fn=safe_collate, # Use the safe collate function
         pin_memory=True
     )
