@@ -475,18 +475,23 @@ class ResUNet30_Base(nn.Module, Base):
         )
         x = F.pad(x, pad=(0, 0, 0, pad_len)) # Pad T axis
         sp_padded_time = F.pad(sp, pad=(0, 0, 0, pad_len)) # Also pad original mag for masking
+        # --- Pad input phase in time as well --- #
+        cos_in_padded_time = F.pad(cos_in, pad=(0, 0, 0, pad_len))
+        sin_in_padded_time = F.pad(sin_in, pad=(0, 0, 0, pad_len))
 
         # Pad frequency axis if needed
         origin_freq_bins = x.shape[-1]
         if origin_freq_bins % 2 != 0:
             x = x[..., 0 : origin_freq_bins - 1] # (bs, channels, T_pad, F_even)
             sp_padded_time_freq = sp_padded_time[..., 0 : origin_freq_bins - 1]
-            cos_in_padded = cos_in[..., 0 : origin_freq_bins - 1]
-            sin_in_padded = sin_in[..., 0 : origin_freq_bins - 1]
+            # Use time-padded versions for phase
+            cos_in_padded = cos_in_padded_time[..., 0 : origin_freq_bins - 1]
+            sin_in_padded = sin_in_padded_time[..., 0 : origin_freq_bins - 1]
         else:
             sp_padded_time_freq = sp_padded_time
-            cos_in_padded = cos_in
-            sin_in_padded = sin_in
+            # Use time-padded versions for phase
+            cos_in_padded = cos_in_padded_time
+            sin_in_padded = sin_in_padded_time
 
         # UNet
         x = self.pre_conv(x)
