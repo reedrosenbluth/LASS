@@ -124,17 +124,17 @@ def get_data_module(
         lock=False
     )
 
-    val_dataset = PrecomputedSTFTDataset(
-        data_path=str(precomputed_val_path),
-        lock=False
-    )
+    # val_dataset = PrecomputedSTFTDataset(
+    #     data_path=str(precomputed_val_path),
+    #     lock=False
+    # )
 
     # data module
     # IMPORTANT: Assumes DataModule accepts train_dataset and val_dataset arguments.
     # If your DataModule definition in data/datamodules.py is different, it needs modification.
     data_module = DataModule(
         train_dataset=train_dataset,
-        val_dataset=val_dataset, # Added validation dataset
+        # val_dataset=val_dataset, # Added validation dataset
         num_workers=num_workers,
         batch_size=batch_size
     )
