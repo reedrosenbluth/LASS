@@ -76,15 +76,42 @@ class AudioSep(pl.LightningModule, PyTorchModelHubMixin):
         batch_stfts = batch_data_dict['stfts']
         stft_win_lengths = batch_data_dict['stft_win_lengths']
         target_waveforms = batch_data_dict['target_waveform']
-        selected_win_len = stft_win_lengths[0]
+        # selected_win_len_tensor = stft_win_lengths[0] # This is likely a tensor for the batch
+        # In collated batch, stft_win_lengths likely looks like [[256, 512, 1024], ...] or just [[256, 512, 1024]]
+        # We need the list of available lengths for this item/batch
+        available_lengths = stft_win_lengths[0] # Assuming it collates to a list containing the list
+        if not isinstance(available_lengths, list):
+             # Handle potential different collation (e.g., if batch size is 1)
+             if isinstance(stft_win_lengths, list) and len(stft_win_lengths) > 0 and isinstance(stft_win_lengths[0], list):
+                 available_lengths = stft_win_lengths[0]
+             else:
+                 raise TypeError(f"Could not determine available STFT window lengths from batch_data_dict['stft_win_lengths']: {stft_win_lengths}")
 
         try:
-            mixture_mag = batch_stfts['mixture'][selected_win_len][0]
-            mixture_cos = batch_stfts['mixture'][selected_win_len][1]
-            mixture_sin = batch_stfts['mixture'][selected_win_len][2]
-        except (KeyError, TypeError, IndexError) as e:
+            # --- Fix: Explicitly select window length 512 --- #
+            desired_win_len = 512
+            if desired_win_len not in available_lengths:
+                 raise ValueError(f"Desired window length {desired_win_len} not found in available lengths: {available_lengths} from batch data.")
+
+            scalar_win_len = desired_win_len # Use the desired integer directly
+
+            # print(f"Debug: Using explicit scalar window length: {scalar_win_len}") # Optional debug print
+
+            # --- Use scalar key for access --- #
+            mixture_mag = batch_stfts['mixture'][scalar_win_len][0]
+            mixture_cos = batch_stfts['mixture'][scalar_win_len][1]
+            mixture_sin = batch_stfts['mixture'][scalar_win_len][2]
+
+            # Assuming you might need segment STFTs later or in other parts of the model:
+            # segment_mag = batch_stfts['segment'][scalar_win_len][0]
+            # segment_cos = batch_stfts['segment'][scalar_win_len][1]
+            # segment_sin = batch_stfts['segment'][scalar_win_len][2]
+
+        except (KeyError, TypeError, IndexError, ValueError) as e: # Added ValueError
             print(f"Error accessing STFT data: {e}")
-            print(f"Selected window length: {selected_win_len}")
+            # print(f"Original selected window length tensor: {selected_win_len_tensor}") # No longer applicable
+            print(f"Available lengths: {available_lengths}")
+            print(f"Attempted key: {scalar_win_len if 'scalar_win_len' in locals() else 'N/A'}")
             print("Batch STFT structure received:", batch_data_dict.get('stfts'))
             raise ValueError("Could not extract STFTs from batch. Check DataLoader collation and PrecomputedSTFTDataset output format.") from e
 
