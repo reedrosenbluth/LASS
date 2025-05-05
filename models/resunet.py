@@ -268,7 +268,16 @@ class ResUNet30_Base(nn.Module, Base):
     def __init__(self, input_channels, output_channels):
         super(ResUNet30_Base, self).__init__()
 
-        window_size = 1024
+        # --- Determine n_fft based on usage --- #
+        # The training loop explicitly uses STFT corresponding to n_fft=512.
+        # Therefore, bn0 must be initialized accordingly.
+        n_fft = 512  # Changed from hardcoded window_size=1024
+
+        # STFT parameters (used for ISTFT and reference)
+        # Keep original window_size for ISTFT if it differs?
+        # For now, assume ISTFT params should also align if possible,
+        # but primary fix is for bn0.
+        window_size = n_fft # Use n_fft for consistency where needed
         hop_size = 160
         center = True
         pad_mode = "reflect"
@@ -291,7 +300,9 @@ class ResUNet30_Base(nn.Module, Base):
             freeze_parameters=True,
         )
 
-        self.bn0 = nn.BatchNorm2d(window_size // 2 + 1, momentum=momentum)
+        # Initialize bn0 with features corresponding to n_fft=512
+        num_freq_bins = n_fft // 2 + 1
+        self.bn0 = nn.BatchNorm2d(num_freq_bins, momentum=momentum)
 
         self.pre_conv = nn.Conv2d(
             in_channels=input_channels, 
