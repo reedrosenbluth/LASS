@@ -439,7 +439,14 @@ class ResUNet30_Base(nn.Module, Base):
 
         # Input is STFT magnitude
         x = stft_magnitude # (batch_size, input_channels=1, time_steps, freq_bins)
-        sp = stft_magnitude # Keep original magnitude for mask application
+
+        # --- Squeeze potential extra dim from collation ---
+        # Collated precomputed STFTs might be (B, 1, C, T, F) instead of (B, C, T, F)
+        if x.dim() == 5 and x.shape[1] == 1:
+            x = x.squeeze(1) # Squeeze the second dimension -> (B, C, T, F)
+        # Now x should be 4D: (B, C, T, F)
+
+        sp = x # Keep original magnitude AFTER potential squeeze for mask application
 
         # Batch normalization
         if x.shape[1] == 1:
@@ -547,25 +554,6 @@ class ResUNet30_Base(nn.Module, Base):
         # waveform = waveform[..., :audio_length] # Needs audio_length!
 
         output_dict = {'waveform': waveform} # Output waveform
-
-        # Squeeze the redundant dimension: (B, 1, 1, T, F) -> (B, 1, T, F) if input was 5D
-        # Or handle potential 4D input (B, C, T, F) from non-precomputed path?
-        # Assuming input `x` at this point is intended to be treated as (B, C, T, F)
-        # where C is the channel dim (potentially 1)
-        if x.dim() == 5 and x.shape[2] == 1: # Check if the likely 5D shape from precomputed is present
-            x = x.squeeze(2)
-        elif x.dim() == 4:
-            pass # Already 4D, likely (B, C, T, F)
-        else:
-            raise ValueError(f"Unexpected tensor dimension {x.dim()} before final permutation in ResUNet forward. Shape: {x.shape}")
-
-        # Permute to (B, F, T, C_out) - Assuming C_out is 1 based on typical use?
-        # Original comment said (B, F, T, 1), let's match that target
-        # Input for permute must be 4D. Current expected shape is (B, C, T, F)
-        x = x.permute(0, 3, 2, 1) # (B, F, T, C)
-
-        # output (B, F, T, C_out) -> waveform (B, T * F * C_out)?
-        # This part depends on how ISTFT or GriffinLim is applied later.
 
         return output_dict
 
