@@ -273,7 +273,7 @@ def train(args) -> NoReturn:
             log_every_n_steps=50,
             use_distributed_sampler=True,
             sync_batchnorm=sync_batchnorm,
-            num_sanity_val_steps=2,
+            num_sanity_val_steps=0,
             enable_checkpointing=False,
             enable_progress_bar=True,
             enable_model_summary=True,

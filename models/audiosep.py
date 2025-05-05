@@ -79,13 +79,35 @@ class AudioSep(pl.LightningModule, PyTorchModelHubMixin):
         # selected_win_len_tensor = stft_win_lengths[0] # This is likely a tensor for the batch
         # In collated batch, stft_win_lengths likely looks like [[256, 512, 1024], ...] or just [[256, 512, 1024]]
         # We need the list of available lengths for this item/batch
-        available_lengths = stft_win_lengths[0] # Assuming it collates to a list containing the list
-        if not isinstance(available_lengths, list):
-             # Handle potential different collation (e.g., if batch size is 1)
-             if isinstance(stft_win_lengths, list) and len(stft_win_lengths) > 0 and isinstance(stft_win_lengths[0], list):
-                 available_lengths = stft_win_lengths[0]
-             else:
-                 raise TypeError(f"Could not determine available STFT window lengths from batch_data_dict['stft_win_lengths']: {stft_win_lengths}")
+        # available_lengths = stft_win_lengths[0] # Assuming it collates to a list containing the list
+        # if not isinstance(available_lengths, list):
+        #      # Handle potential different collation (e.g., if batch size is 1)
+        #      if isinstance(stft_win_lengths, list) and len(stft_win_lengths) > 0 and isinstance(stft_win_lengths[0], list):
+        #          available_lengths = stft_win_lengths[0]
+        #      else:
+        #          raise TypeError(f"Could not determine available STFT window lengths from batch_data_dict['stft_win_lengths']: {stft_win_lengths}")
+
+        # --- Correctly determine available_lengths from collated structure --- #
+        collated_lengths_data = stft_win_lengths # e.g., [tensor([256,...]), tensor([512,...]), ...]
+        available_lengths = []
+        if isinstance(collated_lengths_data, list) and len(collated_lengths_data) > 0:
+            # Check if it's the list of tensors structure
+            if all(isinstance(t, torch.Tensor) for t in collated_lengths_data):
+                try:
+                    # Reconstruct list: take first element of each tensor
+                    available_lengths = [int(t[0].item()) for t in collated_lengths_data]
+                except (IndexError, TypeError) as e:
+                     raise TypeError(f"Could not reconstruct available lengths from list of tensors: {collated_lengths_data}. Error: {e}")
+            # Check if it's the list of list structure (e.g., batch size 1?)
+            elif len(collated_lengths_data) == 1 and isinstance(collated_lengths_data[0], list):
+                 available_lengths = collated_lengths_data[0]
+            # Check if it's already the list of integers (unlikely with batch > 1)
+            elif all(isinstance(l, int) for l in collated_lengths_data):
+                 available_lengths = collated_lengths_data
+
+        if not available_lengths:
+            raise TypeError(f"Could not determine available STFT window lengths from batch_data_dict['stft_win_lengths']: {collated_lengths_data}")
+        # --- End determination --- #
 
         try:
             # --- Fix: Explicitly select window length 512 --- #
