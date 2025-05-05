@@ -13,8 +13,6 @@ import torchaudio.transforms as T
 from torch.utils.data import DataLoader
 from torch.utils.data.dataloader import default_collate
 from torchlibrosa.stft import STFT, magphase
-import lmdb
-import pickle
 
 from data.audiotext_dataset import AudioTextDataset
 from data.waveform_mixers import SegmentMixer
@@ -118,6 +116,90 @@ def load_single_waveform(file_path, target_sr, max_clip_len_seconds, device):
     except Exception as e:
         print(f"Error loading/processing single file {file_path}: {e}")
         return None
+
+def save_batch_precomputed_data(output_dir, batch_index, batch_data_list):
+    """
+    Saves the precomputed STFT data for a whole batch to a single file,
+    ensuring tensors are on CPU.
+
+    Output File Format (`.pt`):
+    Each file contains a list of dictionaries with the following structure:
+    [{
+        'stfts': {
+            'mixture': {
+                <win_len_1>: (mag_tensor, cos_tensor, sin_tensor),
+                ...
+            },
+            'segment': { # Represents the primary segment
+                <win_len_1>: (mag_tensor, cos_tensor, sin_tensor),
+                ...
+            }
+        },
+        'text': str, # Primary segment caption
+        'mixture_component_texts': List[str], # Captions of all segments in the mixture (including primary)
+        'stft_common_params': { ... },
+        'stft_win_lengths': List[int]
+    }]
+    """
+    if not batch_data_list:
+        # This might happen if a batch had items, but all were skipped due to recipe issues.
+        print(f"Warning: Attempting to save empty data list for batch {batch_index}. Skipping file creation.")
+        return 0 # Indicate 0 items saved
+
+    filename = output_dir / f"batch_{batch_index:06d}.pt"
+    batch_cpu_data_list = []
+
+    for data_dict in batch_data_list:
+        # Reuse the CPU conversion logic, applied to each item's dict
+        cpu_data_dict = {}
+        for key, value in data_dict.items():
+            if key == 'stfts' and isinstance(value, dict):
+                cpu_stfts = {}
+                for source_type, stft_results in value.items():
+                    cpu_stfts[source_type] = {}
+                    for win_len, stft_tuple in stft_results.items():
+                        if isinstance(stft_tuple, tuple):
+                            # Ensure tensors are detached and moved to CPU
+                            cpu_stfts[source_type][win_len] = tuple(t.detach().cpu() for t in stft_tuple if isinstance(t, torch.Tensor))
+                        else: # Should not happen, but handle just in case
+                             cpu_stfts[source_type][win_len] = stft_tuple
+                cpu_data_dict[key] = cpu_stfts
+            elif isinstance(value, torch.Tensor):
+                 # Handle potential standalone tensors if added later
+                cpu_data_dict[key] = value.detach().cpu()
+            else:
+                # Keep non-tensor data as is (e.g., text, lists, dicts of primitives)
+                cpu_data_dict[key] = value # Handles text, stft_common_params, stft_win_lengths, mixture_component_texts
+        batch_cpu_data_list.append(cpu_data_dict)
+
+    try:
+        torch.save(batch_cpu_data_list, filename)
+        # print(f"Saved batch {batch_index} ({len(batch_cpu_data_list)} items) to {filename}") # Optional: More verbose logging
+        return len(batch_cpu_data_list) # Return number of items saved
+    except Exception as e:
+        print(f"Error saving batch {batch_index} to {filename}: {e}")
+        # Decide how to handle error: raise? continue? log?
+        # For now, let's print and return 0 items saved for this batch
+        return 0
+
+def _save_worker(q, pbar=None):
+    """Worker function to save data from a queue."""
+    while True:
+        item = q.get()
+        if item is None: # Sentinel value to signal termination
+            q.task_done()
+            break
+        try:
+            filename, data_list = item
+            num_items = len(data_list)
+            torch.save(data_list, filename)
+            if pbar:
+                pbar.update(num_items) # Update progress bar based on items saved
+            # print(f"Saved {num_items} items to {filename}") # Optional debug
+        except Exception as e:
+            print(f"Error saving batch to {filename}: {e}")
+        finally:
+            q.task_done() # Signal that this task is done
 
 def generate_mixture_recipes_for_batch(texts, original_audiopaths, max_mix_num, batch_size):
     """
@@ -327,32 +409,67 @@ def process_files_for_recipes(data_files, target_recipe_file, configs):
     print(f"Finished generating recipes for {target_recipe_file.name}. Total items saved: {len(all_recipes)}.")
     return len(all_recipes)
 
-def _load_recipes(recipe_file):
-    """Loads recipes from a JSON file into a dictionary keyed by original audiopath."""
+def process_files_for_stfts(data_files, target_output_dir, recipe_file, configs, common_stft_params_for_saving):
+    """
+    Processes data files using pre-generated recipes: loads data, performs mixing
+    based on recipes, computes STFTs, and saves results including mixture texts.
+    """
+    print(f"Processing STFTs using recipe file: {recipe_file}")
+    print(f"Output directory: {target_output_dir}")
+    target_output_dir.mkdir(parents=True, exist_ok=True)
+
+    # --- Setup Saving Thread ---
+    save_queue = queue.Queue(maxsize=10) # Limit queue size to prevent excessive memory use
+    # Create a tqdm instance for saving progress, total needs to be set later
+    save_pbar = tqdm(total=0, desc="Saving Batches", unit="item", position=1, leave=False)
+    save_thread = threading.Thread(target=_save_worker, args=(save_queue, save_pbar), daemon=True)
+    save_thread.start()
+    # ---------------------------
+
     print(f"Loading recipes from {recipe_file}...")
     try:
         with open(recipe_file, 'r') as f:
             recipes = json.load(f)
         if not recipes:
              print("Recipe file is empty. Nothing to process.")
-             return None # Indicate empty recipes
-        # Create a dictionary mapping original_audiopath to recipe
+             # Need to ensure thread is handled even if returning early
+             save_queue.put(None)
+             save_thread.join()
+             save_pbar.close()
+             return 0
+         # Create a dictionary mapping original_audiopath to recipe
         recipes_dict = {recipe['original_audiopath']: recipe for recipe in recipes}
         print(f"Loaded {len(recipes_dict)} recipes, indexed by original audio path.")
-        return recipes_dict
+        # Set the total for the save progress bar
+        save_pbar.total = len(recipes_dict)
     except FileNotFoundError:
         print(f"Error: Recipe file not found at {recipe_file}")
-        raise # Re-raise the exception to be handled by the caller
+        # Ensure thread cleanup on error too
+        save_queue.put(None)
+        save_thread.join()
+        save_pbar.close()
+        raise
     except json.JSONDecodeError:
         print(f"Error: Could not decode JSON from recipe file: {recipe_file}")
-        raise # Re-raise the exception
+        # Ensure thread cleanup on error too
+        save_queue.put(None)
+        save_thread.join()
+        save_pbar.close()
+        raise
 
-def _initialize_stft_dataset_loader(data_files, configs):
-    """Initializes the AudioTextDataset and DataLoader for STFT processing."""
     sampling_rate = configs['data']['sampling_rate']
-    max_clip_len = configs['data']['segment_seconds']
+    max_clip_len = configs['data']['segment_seconds'] # Read segment length in seconds
+    max_samples = int(sampling_rate * max_clip_len) # Calculate max_samples
+    lower_db = configs['data']['loudness_norm']['lower_db']
+    higher_db = configs['data']['loudness_norm']['higher_db']
     batch_size = configs['train']['batch_size_per_device']
     num_workers = configs['train']['num_workers']
+
+    stft_hop_length = configs['data']['stft_hop_length']
+    stft_window = configs['data']['stft_window']
+    stft_center = configs['data']['stft_center']
+    stft_pad_mode = configs['data']['stft_pad_mode']
+    stft_win_lengths = configs['data']['stft_win_lengths']
 
     print("Initializing dataset...")
     dataset = AudioTextDataset(
@@ -364,8 +481,8 @@ def _initialize_stft_dataset_loader(data_files, configs):
     print(f"Dataset size for this set: {len(dataset)}")
 
     if not dataset:
-        print(f"Warning: No data found for files: {data_files}. Returning None for dataset/loader.")
-        return None, None
+        print(f"Warning: No data found for files: {data_files}. Skipping STFT computation for {target_output_dir}")
+        return 0
 
     effective_batch_size = batch_size
 
@@ -373,235 +490,237 @@ def _initialize_stft_dataset_loader(data_files, configs):
         dataset,
         batch_size=effective_batch_size,
         shuffle=False,
-        num_workers=num_workers,
-        collate_fn=safe_collate,
-        pin_memory=torch.cuda.is_available() # Pin memory only if CUDA is available
+        num_workers=num_workers, # Use variable read from config
+        collate_fn=safe_collate, # Use the safe collate function
+        pin_memory=True
     )
-    return dataset, dataloader
 
-def _create_batch_mixtures(waveforms, original_audiopaths, recipes_dict, sampling_rate, max_clip_len, loudness_params, device):
-    """
-    Creates mixtures for a batch based on recipes, handling component loading and normalization.
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    loudness_params = {'lower_db': lower_db, 'higher_db': higher_db}
 
-    Args:
-        waveforms (torch.Tensor): Input waveforms for the batch (B_valid, 1, T).
-        original_audiopaths (List[str]): List of original audio paths for the batch.
-        recipes_dict (Dict): Dictionary mapping original_audiopath to recipe.
-        sampling_rate (int): Target sampling rate.
-        max_clip_len (float): Target clip length in seconds.
-        loudness_params (Dict): Parameters for loudness normalization.
-        device (torch.device): Device for processing.
+    print("Starting STFT precomputation loop guided by recipes...")
+    processed_count_for_set = 0
+    # Remove global_item_index_tracker, it's no longer reliable or needed here
+    # global_item_index_tracker = 0
 
-    Returns:
-        Tuple[torch.Tensor, torch.Tensor, List[Dict]]:
-            - final_segments (Tensor): Processed primary segments (B_recipe_found, 1, T).
-            - final_mixtures (Tensor): Created mixtures (B_recipe_found, 1, T).
-            - batch_recipes_used (List): List of recipes corresponding to the returned tensors.
-            Returns (None, None, []) if no valid items with recipes are found.
-    """
-    current_batch_size = waveforms.size(0)
+    for batch_idx, batch in enumerate(tqdm(dataloader)):
+        # Handle the case where safe_collate returns None for an empty batch
+        if batch is None:
+            print(f"Warning: Skipping entirely failed batch {batch_idx}.")
+            continue # Skip processing if the batch is empty
 
-    # 1. Get recipes for the current batch items
-    batch_recipes_used = []
-    valid_indices_in_batch = []
-    skipped_due_to_missing_recipe = 0
-    for i in range(current_batch_size):
-        current_original_path = original_audiopaths[i]
-        recipe = recipes_dict.get(current_original_path)
-        if recipe is None:
-            print(f"Warning: No recipe found for successfully loaded audio path '{current_original_path}'. Skipping item.")
-            skipped_due_to_missing_recipe += 1
+        waveforms = batch['waveform'].to(device) # Shape: (B_valid, 1, T)
+        texts = batch['text']
+        original_audiopaths = batch['original_audiopath'] # List of B_valid paths
+        current_batch_size = waveforms.size(0) # Actual number of valid items in this batch
+
+        if current_batch_size == 0: continue # Should be caught by batch is None
+
+        # --- Vectorized Mixture Creation START ---
+        # 1. Get recipes for the current batch items (which are all valid now)
+        batch_recipes_used = []
+        valid_indices_in_batch = [] # Indices 0 to current_batch_size-1 are all valid
+        skipped_due_to_missing_recipe = 0
+        for i in range(current_batch_size):
+            current_original_path = original_audiopaths[i]
+            recipe = recipes_dict.get(current_original_path)
+            if recipe is None:
+                # This can happen if a file loaded successfully NOW, but failed during recipe generation
+                print(f"Warning: No recipe found for successfully loaded audio path '{current_original_path}'. Skipping item {i} in batch {batch_idx}.")
+                skipped_due_to_missing_recipe += 1
+                continue
+
+            batch_recipes_used.append(recipe)
+            valid_indices_in_batch.append(i) # Track indices within *this valid batch* that have recipes
+
+        if not batch_recipes_used: # If no recipes found for any item in this valid batch
+            print(f"Warning: No recipes found for any of the {current_batch_size} successfully loaded items in batch {batch_idx}.")
             continue
-        batch_recipes_used.append(recipe)
-        valid_indices_in_batch.append(i)
 
-    if not batch_recipes_used:
-        print(f"Warning: No recipes found for any of the {current_batch_size} successfully loaded items in this batch.")
-        return None, None, [] # Indicate no valid items processed
+        # Filter waveforms based on whether a recipe was found
+        valid_waveforms = waveforms[valid_indices_in_batch] # Shape: (B_recipe_found, 1, T)
+        num_valid_items = len(batch_recipes_used) # Number of items with both valid audio AND recipe
 
-    valid_waveforms = waveforms[valid_indices_in_batch]
-    num_valid_items = len(batch_recipes_used)
+        # 2. Gather primary segments
+        primary_segments = valid_waveforms # Shape: (B_recipe_found, 1, T)
 
-    # 2. Gather primary segments
-    primary_segments = valid_waveforms # Shape: (B_recipe_found, 1, T)
+        # 3. Gather and combine noise components
+        noise_accumulator = torch.zeros_like(primary_segments)
+        num_noise_components_added = torch.zeros(num_valid_items, device=device)
 
-    # 3. Gather and combine noise components
-    noise_accumulator = torch.zeros_like(primary_segments)
-    num_noise_components_added = torch.zeros(num_valid_items, device=device)
-    current_valid_batch_paths = [original_audiopaths[i] for i in valid_indices_in_batch]
-    current_valid_batch_path_to_idx_map = {path: k for k, path in enumerate(current_valid_batch_paths)}
-    # current_device = primary_segments.device # Already have device passed in
+        # Create a lookup map for paths -> index in the current *valid* batch (items with recipes)
+        current_valid_batch_paths = [original_audiopaths[i] for i in valid_indices_in_batch]
+        current_valid_batch_path_to_idx_map = {path: k for k, path in enumerate(current_valid_batch_paths)}
 
-    for k, recipe in enumerate(batch_recipes_used): # k iterates from 0 to num_valid_items-1
-        primary_seg_for_norm = primary_segments[k:k+1] # Keep dims (1, 1, T) for reference
-        primary_path = recipe['original_audiopath'] # Path of the primary item for this recipe
-        component_paths_in_recipe = recipe.get('component_original_paths', [])
-        if not component_paths_in_recipe:
-            print(f"Warning: Recipe for '{primary_path}' is missing 'component_original_paths'. Cannot create mixture.")
-            continue # Skip mixing for this item
+        # We need the current device for loading individual files if necessary
+        current_device = primary_segments.device
 
-        item_noise = torch.zeros_like(primary_seg_for_norm) # Shape (1, 1, T)
-        for comp_path in component_paths_in_recipe:
-             if comp_path == primary_path: continue # Skip the primary segment itself
-             next_segment = None
-             comp_idx_in_current_valid_batch = current_valid_batch_path_to_idx_map.get(comp_path)
-             if comp_idx_in_current_valid_batch is not None:
-                 next_segment = primary_segments[comp_idx_in_current_valid_batch:comp_idx_in_current_valid_batch+1]
-             else:
-                  loaded_segment = load_single_waveform(
-                      file_path=comp_path,
-                      target_sr=sampling_rate,
-                      max_clip_len_seconds=max_clip_len,
-                      device=device # Load directly to the processing device
-                  )
-                  if loaded_segment is not None:
-                      if loaded_segment.shape[-1] != primary_seg_for_norm.shape[-1]:
-                           print(f"Warning: Loaded segment {comp_path} time dim {loaded_segment.shape[-1]} "
-                                 f"doesn't match primary {primary_path} time dim {primary_seg_for_norm.shape[-1]} "
-                                 f"after loading. Skipping component.")
-                           continue
-                      next_segment = loaded_segment
-                  else:
-                      print(f"Warning: Failed to load component '{comp_path}' for recipe '{primary_path}'. Skipping component.")
-                      continue
+        for k, recipe in enumerate(batch_recipes_used): # k iterates from 0 to num_valid_items-1
+            primary_seg_for_norm = primary_segments[k:k+1] # Keep dims (1, 1, T) for reference
+            primary_path = recipe['original_audiopath'] # Path of the primary item for this recipe
 
-             if next_segment is not None:
-                 rescaled_next_segment = mixer_dynamic_loudnorm(
-                     audio=next_segment,
-                     reference=primary_seg_for_norm,
+            component_paths_in_recipe = recipe.get('component_original_paths', [])
+            if not component_paths_in_recipe:
+                print(f"Warning: Recipe for '{primary_path}' is missing 'component_original_paths'. Cannot create mixture.")
+                continue # Skip mixing for this item
+
+            item_noise = torch.zeros_like(primary_seg_for_norm) # Shape (1, 1, T)
+
+            for comp_path in component_paths_in_recipe:
+                 if comp_path == primary_path:
+                     continue # Skip the primary segment itself
+
+                 next_segment = None # Initialize next_segment
+
+                 # 1. Try to find component in the current batch
+                 comp_idx_in_current_valid_batch = current_valid_batch_path_to_idx_map.get(comp_path)
+
+                 if comp_idx_in_current_valid_batch is not None:
+                     # Component is present in the current batch, use its waveform
+                     next_segment = primary_segments[comp_idx_in_current_valid_batch:comp_idx_in_current_valid_batch+1] # Keep dims (1, 1, T)
+                 else:
+                      # 2. Component not in batch, attempt to load it individually
+                      # print(f"Debug: Component '{comp_path}' for recipe '{primary_path}' not in batch {batch_idx}. Attempting individual load.") # Optional debug
+                      loaded_segment = load_single_waveform(
+                          file_path=comp_path,
+                          target_sr=sampling_rate,
+                          max_clip_len_seconds=max_clip_len, # Pass seconds
+                          device=current_device # Load directly to the processing device
+                      )
+                      if loaded_segment is not None:
+                          # Ensure loaded segment has the same time dimension as primary_seg_for_norm
+                          # This should be handled by load_single_waveform's padding/trimming
+                          if loaded_segment.shape[-1] != primary_seg_for_norm.shape[-1]:
+                               print(f"Warning: Loaded segment {comp_path} time dim {loaded_segment.shape[-1]} "
+                                     f"doesn't match primary {primary_path} time dim {primary_seg_for_norm.shape[-1]} "
+                                     f"after loading. Check padding/trimming logic. Skipping component.")
+                               continue # Skip if length mismatch persists
+                          next_segment = loaded_segment
+                      else:
+                          # Loading failed, print handled by load_single_waveform
+                          print(f"Warning: Failed to load component '{comp_path}' for recipe '{primary_path}'. Skipping component.")
+                          continue # Skip this component if loading failed
+
+                 # 3. If we have the segment (from batch or loaded), process and add it
+                 if next_segment is not None:
+                     # Apply loudness normalization relative to the primary segment of the *current item k*
+                     # Ensure reference has batch dim for mixer_dynamic_loudnorm if it expects (B, C, T)
+                     rescaled_next_segment = mixer_dynamic_loudnorm(
+                         audio=next_segment, # (1, 1, T)
+                         reference=primary_seg_for_norm, # (1, 1, T)
+                         **loudness_params
+                     )
+                     # Ensure shapes match before adding
+                     if rescaled_next_segment.shape == item_noise.shape:
+                         item_noise += rescaled_next_segment
+                         num_noise_components_added[k] += 1
+                     else:
+                          print(f"Warning: Shape mismatch after loudness norm for component {comp_path}. "
+                                f"ItemNoise: {item_noise.shape}, RescaledNext: {rescaled_next_segment.shape}. Skipping add.")
+
+
+            # Normalize the combined noise for this item *if* components were added
+            if num_noise_components_added[k] > 0:
+                 # Ensure item_noise has batch dim for mixer_dynamic_loudnorm if needed
+                 item_noise = mixer_dynamic_loudnorm(
+                     audio=item_noise, # (1, 1, T)
+                     reference=primary_seg_for_norm, # (1, 1, T)
                      **loudness_params
                  )
-                 if rescaled_next_segment.shape == item_noise.shape:
-                     item_noise += rescaled_next_segment
-                     num_noise_components_added[k] += 1
-                 else:
-                      print(f"Warning: Shape mismatch after loudness norm for component {comp_path}. Skipping add.")
 
-        if num_noise_components_added[k] > 0:
-             item_noise = mixer_dynamic_loudnorm(
-                 audio=item_noise,
-                 reference=primary_seg_for_norm,
-                 **loudness_params
-             )
+            # Store accumulated noise for item k - ensure shape matches accumulator slice
+            if item_noise.shape == noise_accumulator[k:k+1].shape:
+                 noise_accumulator[k:k+1] = item_noise # Store accumulated noise for item k using slicing
+            else:
+                  print(f"Warning: Final item_noise shape {item_noise.shape} mismatch "
+                        f"with noise_accumulator slice {noise_accumulator[k:k+1].shape}. Skipping accumulation.")
 
-        if item_noise.shape == noise_accumulator[k:k+1].shape:
-             noise_accumulator[k:k+1] = item_noise
-        else:
-              print(f"Warning: Final item_noise shape {item_noise.shape} mismatch with noise_accumulator slice. Skipping accumulation.")
 
-    # 4. Create Mixtures
-    mixtures = primary_segments + noise_accumulator # Shape: (B_recipe_found, 1, T)
+        # 4. Create Mixtures
+        mixtures = primary_segments + noise_accumulator # Shape: (B_recipe_found, 1, T)
 
-    # 5. De-clipping
-    max_values, _ = torch.max(torch.abs(mixtures.squeeze(1)), dim=1)
-    needs_clipping = max_values > 1.0
-    gain = torch.ones_like(max_values)
-    gain[needs_clipping] = 0.9 / max_values[needs_clipping]
-    gain = gain.unsqueeze(-1).unsqueeze(-1)
-    final_segments = primary_segments * gain
-    final_mixtures = mixtures * gain
+        # 5. De-clipping (Batched on B_recipe_found items)
+        max_values, _ = torch.max(torch.abs(mixtures.squeeze(1)), dim=1)
+        needs_clipping = max_values > 1.0
+        gain = torch.ones_like(max_values)
+        gain[needs_clipping] = 0.9 / max_values[needs_clipping]
+        gain = gain.unsqueeze(-1).unsqueeze(-1)
 
-    return final_segments, final_mixtures, batch_recipes_used
+        final_segments = primary_segments * gain
+        final_mixtures = mixtures * gain
 
-def _calculate_batch_stfts(segments_tensor, mixtures_tensor, stft_win_lengths, stft_hop_length, stft_window, stft_center, stft_pad_mode):
-    """
-    Calculates STFT components for batch of segments and mixtures across multiple window lengths.
+        # --- Vectorized Mixture Creation END ---
 
-    Args:
-        segments_tensor (torch.Tensor): Tensor of primary segments (B, 1, T).
-        mixtures_tensor (torch.Tensor): Tensor of mixtures (B, 1, T).
-        stft_win_lengths (List[int]): List of window lengths (and FFT sizes) to use.
-        stft_hop_length (int): STFT hop length.
-        stft_window (str): STFT window type.
-        stft_center (bool): STFT center parameter.
-        stft_pad_mode (str): STFT padding mode.
+        mixtures_tensor = final_mixtures
+        segments_tensor = final_segments
 
-    Returns:
-        Tuple[Dict, Dict]:
-            - batch_segment_stfts (Dict): {win_len: (mag, cos, sin)} for segments.
-            - batch_mixture_stfts (Dict): {win_len: (mag, cos, sin)} for mixtures.
-    """
-    batch_mixture_stfts = {win_len: None for win_len in stft_win_lengths}
-    batch_segment_stfts = {win_len: None for win_len in stft_win_lengths}
+        if mixtures_tensor.size(0) == 0: # Should not happen if batch_recipes_used check passed, but safe
+            continue
 
-    with torch.no_grad():
-        for win_length in stft_win_lengths:
-            n_fft = win_length
-            current_stft_params = {
-                'n_fft': n_fft,
-                'hop_length': stft_hop_length,
-                'win_length': win_length,
-                'window': stft_window,
-                'center': stft_center,
-                'pad_mode': stft_pad_mode,
-            }
+        # Compute STFTs for the batch of valid items with recipes
+        with torch.no_grad():
+            batch_mixture_stfts = {win_len: None for win_len in stft_win_lengths}
+            batch_segment_stfts = {win_len: None for win_len in stft_win_lengths}
 
-            mixture_mag, mixture_cos, mixture_sin = calculate_stft_components(
-                mixtures_tensor, **current_stft_params
-            )
-            batch_mixture_stfts[win_length] = (mixture_mag, mixture_cos, mixture_sin)
-
-            segment_mag, segment_cos, segment_sin = calculate_stft_components(
-                segments_tensor, **current_stft_params
-            )
-            batch_segment_stfts[win_length] = (segment_mag, segment_cos, segment_sin)
-
-    return batch_segment_stfts, batch_mixture_stfts
-
-def _write_batch_to_lmdb(lmdb_env, batch_segment_stfts, batch_mixture_stfts, segments_tensor, batch_recipes_used, stft_win_lengths, common_stft_params_for_saving, lmdb_item_idx, batch_idx):
-    """
-    Writes a batch of processed STFT data to the LMDB database.
-
-    Args:
-        lmdb_env (lmdb.Environment): The LMDB environment.
-        batch_segment_stfts (Dict): STFT data for segments.
-        batch_mixture_stfts (Dict): STFT data for mixtures.
-        segments_tensor (torch.Tensor): Target segment waveforms.
-        batch_recipes_used (List[Dict]): Recipes for the items in this batch.
-        stft_win_lengths (List[int]): List of STFT window lengths used.
-        common_stft_params_for_saving (Dict): Common STFT params to save.
-        lmdb_item_idx (int): Starting index for items in this batch.
-        batch_idx (int): Index of the current batch (for logging).
-
-    Returns:
-        int: Number of items successfully written in this batch.
-    """
-    items_written_in_batch = 0
-    num_items_in_batch = segments_tensor.size(0)
-
-    if num_items_in_batch == 0:
-        return 0
-
-    try:
-        with lmdb_env.begin(write=True) as txn:
-            for k in range(num_items_in_batch):
-                recipe_for_item = batch_recipes_used[k]
-                target_waveform_for_item = segments_tensor[k]
-
-                # Prepare STFT data for this item
-                item_mixture_stfts = {}
-                item_segment_stfts = {}
-                for win_len in stft_win_lengths:
-                    # Slice the batch tensors to get data for item k
-                    item_mixture_stfts[win_len] = tuple(t[k:k+1] for t in batch_mixture_stfts[win_len])
-                    item_segment_stfts[win_len] = tuple(t[k:k+1] for t in batch_segment_stfts[win_len])
-
-                # Create the dictionary to save
-                data_to_save = {
-                    'stfts': {
-                        'mixture': item_mixture_stfts,
-                        'segment': item_segment_stfts
-                    },
-                    'target_waveform': target_waveform_for_item,
-                    'text': recipe_for_item['primary_segment_text'],
-                    'mixture_component_texts': recipe_for_item['mixture_component_texts'],
-                    'stft_common_params': common_stft_params_for_saving,
-                    'stft_win_lengths': stft_win_lengths
+            for win_length in stft_win_lengths:
+                n_fft = win_length
+                current_stft_params = {
+                    'n_fft': n_fft,
+                    'hop_length': stft_hop_length,
+                    'win_length': win_length,
+                    'window': stft_window,
+                    'center': stft_center,
+                    'pad_mode': stft_pad_mode,
                 }
 
-                # Ensure all tensors are on CPU before pickling
+                mixture_mag, mixture_cos, mixture_sin = calculate_stft_components(
+                    mixtures_tensor, **current_stft_params
+                )
+                batch_mixture_stfts[win_length] = (mixture_mag, mixture_cos, mixture_sin)
+
+                segment_mag, segment_cos, segment_sin = calculate_stft_components(
+                    segments_tensor, **current_stft_params
+                )
+                batch_segment_stfts[win_length] = (segment_mag, segment_cos, segment_sin)
+
+
+        # Prepare data for saving (loop through the items that had valid audio AND a recipe)
+        batch_data_to_save = []
+        num_items_in_batch_processed_stft = mixtures_tensor.size(0)
+
+        for k in range(num_items_in_batch_processed_stft): # Loop index 'k' corresponds to valid items with recipes
+            recipe_for_item = batch_recipes_used[k] # Get recipe corresponding to this processed item
+            # item_output_index = recipe_for_item['output_index'] # Use this index from recipe generation
+            target_waveform_for_item = segments_tensor[k] # Get the corresponding target waveform
+
+            item_mixture_stfts = {}
+            item_segment_stfts = {}
+            for win_len in stft_win_lengths:
+                item_mixture_stfts[win_len] = tuple(t[k:k+1] for t in batch_mixture_stfts[win_len])
+                item_segment_stfts[win_len] = tuple(t[k:k+1] for t in batch_segment_stfts[win_len])
+
+            data_to_save = {
+                'stfts': {
+                    'mixture': item_mixture_stfts,
+                    'segment': item_segment_stfts
+                },
+                'target_waveform': target_waveform_for_item,
+                'text': recipe_for_item['primary_segment_text'],
+                'mixture_component_texts': recipe_for_item['mixture_component_texts'],
+                'stft_common_params': common_stft_params_for_saving,
+                'stft_win_lengths': stft_win_lengths
+                # 'output_index': item_output_index # Keep for potential debugging/ordering
+            }
+            batch_data_to_save.append(data_to_save)
+
+        # Save the collected batch data asynchronously
+        if batch_data_to_save:
+            # ... (CPU conversion logic remains the same) ...
+            batch_cpu_data_list = []
+            for data_dict in batch_data_to_save:
                 cpu_data_dict = {}
-                for key, value in data_to_save.items():
+                for key, value in data_dict.items():
                     if key == 'stfts' and isinstance(value, dict):
                         cpu_stfts = {}
                         for source_type, stft_results in value.items():
@@ -610,145 +729,50 @@ def _write_batch_to_lmdb(lmdb_env, batch_segment_stfts, batch_mixture_stfts, seg
                                 if isinstance(stft_tuple, tuple):
                                     cpu_stfts[source_type][win_len] = tuple(t.detach().cpu() for t in stft_tuple if isinstance(t, torch.Tensor))
                                 else:
-                                     cpu_stfts[source_type][win_len] = stft_tuple # Should not happen if input is correct
+                                     cpu_stfts[source_type][win_len] = stft_tuple
                         cpu_data_dict[key] = cpu_stfts
+                    elif isinstance(value, torch.Tensor) and key == 'target_waveform':
+                        cpu_data_dict[key] = value.detach().cpu()
                     elif isinstance(value, torch.Tensor):
                         cpu_data_dict[key] = value.detach().cpu()
                     else:
                         cpu_data_dict[key] = value
+                batch_cpu_data_list.append(cpu_data_dict)
 
-                # Generate key and serialize value
-                current_item_key = str(lmdb_item_idx + k).encode('utf-8')
-                value_bytes = pickle.dumps(cpu_data_dict, protocol=pickle.HIGHEST_PROTOCOL)
 
-                # Write to LMDB
-                txn.put(current_item_key, value_bytes)
-                items_written_in_batch += 1
+            filename = target_output_dir / f"batch_{batch_idx:06d}.pt" # Use batch_idx for consistency
+            save_queue.put((filename, batch_cpu_data_list))
+            processed_count_for_set += len(batch_cpu_data_list) # Increment by number saved
 
-    except lmdb.Error as e:
-         # Log error with more specific info
-         print(f"LMDB Error during batch write (batch {batch_idx}, approx item index start {lmdb_item_idx}): {e}")
-         # Depending on the error (e.g., map_full), might want to raise or handle differently.
-         # For now, we assume the transaction is aborted, and return count before error.
-         # The caller's processed_count_for_set will only reflect successfully committed items.
-         pass # Transaction automatically aborted on exception
-    except Exception as e:
-         print(f"Unexpected error during LMDB batch write (batch {batch_idx}): {e}")
-         # Handle unexpected errors during pickling or data prep before txn.put
-         raise # Re-raise unexpected errors
+        # Removed advancement of global_item_index_tracker
+        # global_item_index_tracker += current_batch_size
 
-    return items_written_in_batch
+    # ... (Wait for saving thread logic remains the same) ...
+    print("Waiting for all save operations to complete...")
+    save_queue.put(None)
+    save_queue.join()
+    save_thread.join()
+    save_pbar.close()
+    print("Saving thread finished.")
 
-def process_files_for_stfts(data_files, target_output_dir, recipe_file, configs, common_stft_params_for_saving, lmdb_env):
-    """
-    Processes data files using pre-generated recipes: loads data, performs mixing
-    based on recipes, computes STFTs, and saves results individually to LMDB.
-    """
-    # Target output dir is now the LMDB *directory* path, not for saving individual files
-    print(f"Processing STFTs using recipe file: {recipe_file}")
-    print(f"Output LMDB directory: {target_output_dir}")
 
-    # --- Load Recipes --- #
-    recipes_dict = _load_recipes(recipe_file)
-    if recipes_dict is None:
-        return 0 # Return 0 items processed if recipes are empty or file not found
-
-    # --- Initialize Dataset and DataLoader --- #
-    dataset, dataloader = _initialize_stft_dataset_loader(data_files, configs)
-    if dataset is None or dataloader is None:
-        return 0 # Return 0 items processed if dataset failed to initialize
-
-    # --- Setup STFT Parameters and Device --- #
-    sampling_rate = configs['data']['sampling_rate'] # Needed for _create_batch_mixtures
-    max_clip_len = configs['data']['segment_seconds'] # Needed for _create_batch_mixtures
-    lower_db = configs['data']['loudness_norm']['lower_db']
-    higher_db = configs['data']['loudness_norm']['higher_db']
-    stft_hop_length = configs['data']['stft_hop_length']
-    stft_window = configs['data']['stft_window']
-    stft_center = configs['data']['stft_center']
-    stft_pad_mode = configs['data']['stft_pad_mode']
-    stft_win_lengths = configs['data']['stft_win_lengths']
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-    loudness_params = {'lower_db': lower_db, 'higher_db': higher_db}
-
-    # --- Main Processing Loop --- #
-    print("Starting STFT precomputation loop guided by recipes (writing to LMDB)...")
-    lmdb_item_idx = 0 # Initialize global LMDB item index counter for this dataset split
-    processed_count_for_set = 0 # Track total items successfully written to LMDB for this split
-
-    pbar = tqdm(dataloader, position=0, leave=True)
-    for batch_idx, batch in enumerate(pbar):
-        if batch is None:
-            print(f"Warning: Skipping entirely failed batch {batch_idx}.")
-            continue
-
-        waveforms = batch['waveform'].to(device)
-        original_audiopaths = batch['original_audiopath']
-
-        if waveforms.size(0) == 0: continue
-
-        # --- Create Mixtures --- #
-        segments_tensor, mixtures_tensor, batch_recipes_used = _create_batch_mixtures(
-            waveforms=waveforms,
-            original_audiopaths=original_audiopaths,
-            recipes_dict=recipes_dict,
-            sampling_rate=sampling_rate,
-            max_clip_len=max_clip_len,
-            loudness_params=loudness_params,
-            device=device
-        )
-
-        if segments_tensor is None or mixtures_tensor is None or not batch_recipes_used:
-            continue
-
-        # --- Compute STFTs --- #
-        batch_segment_stfts, batch_mixture_stfts = _calculate_batch_stfts(
-            segments_tensor=segments_tensor,
-            mixtures_tensor=mixtures_tensor,
-            stft_win_lengths=stft_win_lengths,
-            stft_hop_length=stft_hop_length,
-            stft_window=stft_window,
-            stft_center=stft_center,
-            stft_pad_mode=stft_pad_mode
-        )
-
-        # --- Write Batch to LMDB --- #
-        items_written = _write_batch_to_lmdb(
-            lmdb_env=lmdb_env,
-            batch_segment_stfts=batch_segment_stfts,
-            batch_mixture_stfts=batch_mixture_stfts,
-            segments_tensor=segments_tensor,
-            batch_recipes_used=batch_recipes_used,
-            stft_win_lengths=stft_win_lengths,
-            common_stft_params_for_saving=common_stft_params_for_saving,
-            lmdb_item_idx=lmdb_item_idx, # Pass the current global index start for this batch
-            batch_idx=batch_idx
-        )
-
-        # Update counters and progress bar
-        if items_written > 0:
-            processed_count_for_set += items_written
-            lmdb_item_idx += items_written # Advance global index by number actually written
-            pbar.set_description(f"Processing STFTs (Items Written: {processed_count_for_set})")
-        elif items_written < len(batch_recipes_used):
-            # This case handles partial writes within a batch due to LMDB errors
-            print(f"Warning: Batch {batch_idx} write potentially incomplete due to LMDB error.")
-            pbar.set_description(f"Processing STFTs (Items Written: {processed_count_for_set} - Check Errors)")
-            # lmdb_item_idx is only incremented by items_written, maintaining consistency
-
-    # --- Final Reporting --- #
+    # Compare processed count with the number of recipes loaded
     num_recipes_loaded = len(recipes_dict)
     if processed_count_for_set != num_recipes_loaded:
-        print(f"Warning: Final count of items written to LMDB ({processed_count_for_set}) does not match number of recipes loaded ({num_recipes_loaded}). "
-              f"Potential reasons: audio loading failures during dataset iteration, recipe generation failures, or LMDB write errors (check logs).")
+        # This warning is now more meaningful: it indicates items that loaded successfully
+        # but didn't have a corresponding recipe (likely failed during recipe gen).
+        print(f"Warning: Number of processed items ({processed_count_for_set}) does not match number of recipes loaded ({num_recipes_loaded}). "
+              f"This difference may be due to audio files failing during recipe generation but loading successfully now, or vice-versa.")
 
+    # Report dropped count based on the dataset's internal counter during STFT phase
     dropped_count_stft = dataset.get_dropped_count()
     if dropped_count_stft > 0:
-         print(f"Note: {dropped_count_stft} audio files failed to load correctly by the dataset and were skipped before STFT processing.")
+         print(f"Note: {dropped_count_stft} audio files failed to load correctly and were skipped during STFT computation.")
 
-    print(f"Finished STFT processing for {target_output_dir}. Wrote {processed_count_for_set} items to LMDB.")
-    return processed_count_for_set # Return the number of items actually written
+
+    print(f"Finished STFT processing for {target_output_dir}. Saved {processed_count_for_set} items.")
+    return processed_count_for_set
+
 
 def main(args, parser):
     """
@@ -842,30 +866,17 @@ def main(args, parser):
     elif args.mode == 'compute_stfts':
         # Validate required arguments for this mode
         if not args.output_dir:
-             parser.error("--output_dir is required for 'compute_stfts' mode (specify the base directory for LMDB files).")
+             parser.error("--output_dir is required for 'compute_stfts' mode.")
         if not args.input_recipe_dir:
              parser.error("--input_recipe_dir is required for 'compute_stfts' mode.")
 
-        # Setup LMDB Output Dirs and Parameters
+        # Setup STFT Output Dirs (Moved INSIDE this block)
         base_output_dir = pathlib.Path(args.output_dir)
-        train_lmdb_path = base_output_dir / "train.lmdb" # Directory for LMDB
-        val_lmdb_path = base_output_dir / "val.lmdb"   # Directory for LMDB
-        print(f"LMDB base output directory: {base_output_dir}")
-        print(f"Training LMDB path: {train_lmdb_path}")
-        print(f"Validation LMDB path: {val_lmdb_path}")
-
-        # --- Estimate map_size ---
-        # IMPORTANT: Adjust these values based on your expected dataset size!
-        # These are placeholders. Calculate roughly:
-        # (Number of items) * (Avg size per item in bytes) * (Multiplier > 1, e.g., 1.5-2.0)
-        # Example: 1 million train items, ~1MB each -> 1TB. Set map_size to 1.5-2.0 TB.
-        map_size_train_gb = configs.get('data', {}).get('lmdb_map_size_train_gb', 1500) # Default 1.5 TB
-        map_size_val_gb = configs.get('data', {}).get('lmdb_map_size_val_gb', 500)     # Default 0.5 TB
-        map_size_train_bytes = int(map_size_train_gb * 1024**3)
-        map_size_val_bytes = int(map_size_val_gb * 1024**3)
-        print(f"LMDB map_size (Train): {map_size_train_gb} GB")
-        print(f"LMDB map_size (Val): {map_size_val_gb} GB")
-        # Consider adding these map sizes to your config YAML for easier management
+        train_output_dir = base_output_dir / "train"
+        val_output_dir = base_output_dir / "val"
+        print(f"STFT output directory: {base_output_dir}")
+        print(f"Training STFT output directory: {train_output_dir}")
+        print(f"Validation STFT output directory: {val_output_dir}")
 
         # Setup Recipe Input Paths
         base_recipe_dir = pathlib.Path(args.input_recipe_dir)
@@ -873,72 +884,50 @@ def main(args, parser):
         val_recipe_file = base_recipe_dir / "val_mixture_recipes.json"
         print(f"Recipe input directory: {base_recipe_dir}")
 
-        # Extract STFT common parameters for saving (already have them from above)
-        # ... common_stft_params_for_saving is already defined ...
+        # Extract STFT common parameters for saving
+        # Ensure 'data' key exists before accessing subkeys
+        if 'data' not in configs:
+             parser.error("Missing 'data' section in config YAML required for STFT parameters.")
+
+        try:
+            stft_hop_length = configs['data']['stft_hop_length']
+            stft_window = configs['data']['stft_window']
+            stft_center = configs['data']['stft_center']
+            stft_pad_mode = configs['data']['stft_pad_mode']
+            stft_win_lengths = configs['data']['stft_win_lengths'] # Needed here too
+        except KeyError as e:
+             parser.error(f"Missing required STFT parameter in config YAML under 'data': {e}")
+
+        common_stft_params_for_saving = {
+            'hop_length': stft_hop_length,
+            'window': stft_window,
+            'center': stft_center,
+            'pad_mode': stft_pad_mode,
+        }
 
         # Process Training Files
-        train_env = None # Initialize to None
-        try:
-            print(f"\n--- Opening Training LMDB Environment [{train_lmdb_path}] ---")
-            # Ensure parent directory exists
-            train_lmdb_path.parent.mkdir(parents=True, exist_ok=True)
-            train_env = lmdb.open(
-                str(train_lmdb_path),
-                map_size=map_size_train_bytes,
-                readonly=False,
-                metasync=False, # Faster writes, riskier on crash
-                sync=False,     # Faster writes, riskier on crash
-                map_async=True, # Faster writes
-                lock=True       # Needed for multi-process write? Usually True for single writer.
-                                # Consider lock=False if only this process writes.
-            )
-            print("\n--- Processing Training Set STFTs ---")
-            total_train_processed = process_files_for_stfts(
-                data_files=args.train_data_files,
-                target_output_dir=train_lmdb_path, # Pass LMDB path
-                recipe_file=train_recipe_file,
-                configs=configs,
-                common_stft_params_for_saving=common_stft_params_for_saving,
-                lmdb_env=train_env # Pass the environment
-            )
-        finally:
-             if train_env:
-                 print(f"\n--- Closing Training LMDB Environment [{train_lmdb_path}] ---")
-                 train_env.close()
+        print("\n--- Processing Training Set STFTs ---")
+        total_train_processed = process_files_for_stfts(
+            data_files=args.train_data_files,
+            target_output_dir=train_output_dir,
+            recipe_file=train_recipe_file,
+            configs=configs,
+            common_stft_params_for_saving=common_stft_params_for_saving
+        )
 
         # Process Validation Files
-        val_env = None # Initialize to None
-        try:
-            print(f"\n--- Opening Validation LMDB Environment [{val_lmdb_path}] ---")
-            # Ensure parent directory exists
-            val_lmdb_path.parent.mkdir(parents=True, exist_ok=True)
-            val_env = lmdb.open(
-                str(val_lmdb_path),
-                map_size=map_size_val_bytes,
-                readonly=False,
-                metasync=False,
-                sync=False,
-                map_async=True,
-                lock=True
-            )
-            print("\n--- Processing Validation Set STFTs ---")
-            total_val_processed = process_files_for_stfts(
-                data_files=args.val_data_files,
-                target_output_dir=val_lmdb_path, # Pass LMDB path
-                recipe_file=val_recipe_file,
-                configs=configs,
-                common_stft_params_for_saving=common_stft_params_for_saving,
-                lmdb_env=val_env # Pass the environment
-            )
-        finally:
-             if val_env:
-                 print(f"\n--- Closing Validation LMDB Environment [{val_lmdb_path}] ---")
-                 val_env.close()
-
+        print("\n--- Processing Validation Set STFTs ---")
+        total_val_processed = process_files_for_stfts(
+            data_files=args.val_data_files,
+            target_output_dir=val_output_dir,
+            recipe_file=val_recipe_file,
+            configs=configs,
+            common_stft_params_for_saving=common_stft_params_for_saving
+        )
 
         print(f"\nFinished STFT computation.")
-        print(f"Total training items written to LMDB: {total_train_processed}")
-        print(f"Total validation items written to LMDB: {total_val_processed}")
+        print(f"Total training items processed: {total_train_processed}")
+        print(f"Total validation items processed: {total_val_processed}")
 
     else:
         # Raise error if mode not recognized
@@ -958,16 +947,12 @@ if __name__ == "__main__":
     parser.add_argument('--val_data_files', type=str, default=None, nargs='+',
                         help='Path(s) to the validation dataset JSON file(s) (overrides config if specified).')
     parser.add_argument('--output_dir', type=str, default=None,
-                        help='Base directory to save LMDB database files (will create train.lmdb/ and val.lmdb/ subdirs). Required for compute_stfts mode.')
+                        help='Directory to save precomputed STFT files (will create train/ and val/ subdirs).')
     parser.add_argument('--output_recipe_dir', type=str, default=None,
                         help="Directory to save recipe JSON files (mode='generate_recipes'). Expects train_mixture_recipes.json and val_mixture_recipes.json.")
     parser.add_argument('--input_recipe_dir', type=str, default=None,
                         help="Directory containing recipe JSON files to use (mode='compute_stfts'). Expects train_mixture_recipes.json and val_mixture_recipes.json.")
 
     args = parser.parse_args()
-
-    # Add LMDB map size args (optional, can also be in config)
-    # parser.add_argument('--lmdb_map_size_train_gb', type=int, default=1500, help='Estimated map size in GB for training LMDB.')
-    # parser.add_argument('--lmdb_map_size_val_gb', type=int, default=500, help='Estimated map size in GB for validation LMDB.')
 
     main(args, parser) # Pass parser to main 

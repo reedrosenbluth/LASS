@@ -3,71 +3,94 @@ from torch.utils.data import Dataset
 import pathlib
 import bisect
 from typing import List, Dict, Optional, Tuple, Any
+import lmdb   # Added
+import pickle # Added
+import threading # Keep for potential lock usage later?
 
 class PrecomputedSTFTDataset(Dataset):
     """
-    A PyTorch Dataset for loading precomputed STFT data saved in batch files.
+    A PyTorch Dataset for loading precomputed STFT data from an LMDB database.
 
-    Assumes data is stored in a directory where each file (e.g., batch_XXXXXX.pt)
-    contains a list of dictionaries, each dictionary representing one precomputed item.
+    Assumes data is stored in an LMDB environment where keys are string representations
+    of indices (e.g., '0', '1', ...) and values are pickled dictionaries.
     """
-    def __init__(self, data_dir: str, expected_num_items: Optional[int] = None):
+    def __init__(self, data_path: str, lock: bool = False):
         """
-        Initializes the dataset by scanning the data directory and mapping indices.
+        Initializes the dataset by opening the LMDB environment.
 
         Args:
-            data_dir (str): Path to the directory containing the precomputed .pt files.
-            expected_num_items (Optional[int]): If provided, verifies the total number
-                                                 of items found matches this value.
+            data_path (str): Path to the LMDB database directory (e.g., /path/to/train.lmdb).
+            lock (bool): Whether to use file locking. Should be False for 
+                         multi-process DataLoader workers, True if unsure or single process.
         """
-        self.data_dir = pathlib.Path(data_dir)
-        if not self.data_dir.is_dir():
-            raise FileNotFoundError(f"Data directory not found: {self.data_dir}")
+        self.lmdb_path = pathlib.Path(data_path)
+        self.env: Optional[lmdb.Environment] = None
+        self.txn: Optional[lmdb.Transaction] = None
+        self.total_items: int = 0
+        # Add a lock for thread-safe initialization of the transaction if needed
+        # Although typically __init__ runs before workers fork
+        self._init_lock = threading.Lock()
 
-        self.file_paths: List[pathlib.Path] = []
-        self.item_counts: List[int] = []
-        self.cumulative_counts: List[int] = [0] # cumulative[i] = total items BEFORE file i
+        if not self.lmdb_path.exists() or not self.lmdb_path.is_dir():
+            # LMDB often creates a directory. Check if the parent exists if path is file-like
+            if self.lmdb_path.with_suffix('').exists() and self.lmdb_path.with_suffix('').is_dir():
+                 self.lmdb_path = self.lmdb_path.with_suffix('') # Use the directory
+            else:
+                 raise FileNotFoundError(f"LMDB directory not found at: {data_path}")
 
-        print(f"Scanning directory for precomputed data: {self.data_dir}")
-        # Sort files numerically based on batch index assumed in filename
-        sorted_files = sorted(self.data_dir.glob("batch_*.pt"),
-                              key=lambda p: int(p.stem.split('_')[-1]))
+        try:
+            # Open the LMDB environment (read-only)
+            self.env = lmdb.open(
+                str(self.lmdb_path),
+                readonly=True,
+                lock=lock,         # Set based on arg - IMPORTANT for DataLoader!
+                readahead=False,   # Generally False for random access
+                meminit=False,     # Don't initialize map in read-only
+                max_readers=126    # Default, adjust if needed
+            )
 
-        if not sorted_files:
-            print(f"Warning: No 'batch_*.pt' files found in {self.data_dir}. Dataset will be empty.")
-            self.total_items = 0
-            return
+            if self.env is None:
+                 raise IOError(f"LMDB environment is None after opening {self.lmdb_path}")
 
-        for file_path in sorted_files:
-            try:
-                # Load only to get the count, assumes data is on CPU or can be mapped
-                # Using map_location='cpu' is safer if files were saved from GPU
-                loaded_list = torch.load(file_path, map_location='cpu')
-                if not isinstance(loaded_list, list):
-                     print(f"Warning: Expected a list in {file_path}, got {type(loaded_list)}. Skipping file.")
-                     continue
+            # Get total number of items from LMDB stats
+            with self.env.begin(write=False) as txn_stat:
+                self.total_items = txn_stat.stat()['entries']
 
-                item_count = len(loaded_list)
-                if item_count > 0:
-                    self.file_paths.append(file_path)
-                    self.item_counts.append(item_count)
-                    self.cumulative_counts.append(self.cumulative_counts[-1] + item_count)
-                else:
-                    print(f"Warning: File {file_path} contains an empty list. Skipping.")
+            print(f"Opened LMDB: {self.lmdb_path}. Found {self.total_items} items.")
 
-            except Exception as e:
-                print(f"Warning: Failed to load or process {file_path}. Skipping. Error: {e}")
+            # Create a persistent read transaction (for efficiency)
+            # This might need care with multiprocessing if env is not locked correctly
+            # Consider creating transaction inside __getitem__ if issues arise
+            self._reopen_transaction() # Use a helper to initialize txn
 
+        except lmdb.Error as e:
+             raise IOError(f"Failed to open LMDB environment at {self.lmdb_path}. Error: {e}")
+        except Exception as e:
+            # Catch other potential errors during init
+             if self.env:
+                 self.env.close()
+             raise IOError(f"Error initializing PrecomputedSTFTDataset: {e}")
 
-        self.total_items = self.cumulative_counts[-1]
-        print(f"Found {self.total_items} items across {len(self.file_paths)} files.")
+    def _reopen_transaction(self):
+        """Helper to open/reopen the read transaction."""
+        # Close existing transaction if it exists
+        # This might not be strictly necessary but ensures clean state
+        # if called multiple times (e.g., after worker fork?)
+        # if self.txn:
+        #     self.txn = None # Abort previous if any
 
-        if expected_num_items is not None and self.total_items != expected_num_items:
-            print(f"Warning: Found {self.total_items} items, but expected {expected_num_items}.")
-
-        # Cache for the most recently loaded file to speed up sequential access
-        self._cached_file_idx: Optional[int] = None
-        self._cached_data: Optional[List[Dict]] = None
+        if self.env:
+             try:
+                 self.txn = self.env.begin(write=False)
+                 # print(f"Opened new read transaction for {self.lmdb_path}") # Debug
+             except lmdb.Error as e:
+                 print(f"Error creating read transaction for {self.lmdb_path}: {e}")
+                 self.txn = None # Ensure txn is None on failure
+                 # Potentially try reopening the environment? For now, just fail.
+                 raise
+        else:
+             print("Warning: Cannot reopen transaction, LMDB environment is not open.")
+             self.txn = None
 
     def __len__(self) -> int:
         """Returns the total number of items in the dataset."""
@@ -75,10 +98,10 @@ class PrecomputedSTFTDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         """
-        Retrieves the precomputed data for the item at the given global index.
+        Retrieves the precomputed data for the item at the given index from LMDB.
 
         Args:
-            idx (int): The global index of the item to retrieve.
+            idx (int): The index of the item to retrieve.
 
         Returns:
             Dict[str, Any]: A dictionary containing the precomputed STFTs, text,
@@ -86,128 +109,115 @@ class PrecomputedSTFTDataset(Dataset):
 
         Raises:
             IndexError: If the index is out of bounds.
+            KeyError: If the key for the index is not found in LMDB.
+            RuntimeError: If the LMDB transaction is not available.
         """
         if not 0 <= idx < self.total_items:
             raise IndexError(f"Index {idx} out of bounds for dataset with size {self.total_items}")
 
-        # Find which file contains the item using binary search on cumulative counts
-        # bisect_right returns insertion point > all elements <= target
-        # We want the index `file_idx` such that cumulative_counts[file_idx] <= idx < cumulative_counts[file_idx+1]
-        file_idx = bisect.bisect_right(self.cumulative_counts, idx) - 1
+        # Ensure transaction is available (might be needed if workers re-initialize)
+        # This check adds overhead, consider alternatives if it becomes a bottleneck
+        if self.txn is None:
+            # Attempt to reopen transaction, potentially needed after fork
+            # Use lock to prevent race condition if multiple workers hit this? Usually not necessary.
+            # with self._init_lock:
+            #     if self.txn is None:
+            #         self._reopen_transaction()
+            # if self.txn is None:
+                 raise RuntimeError(f"LMDB transaction is not available for index {idx}. Environment might be closed or failed to initialize transaction.")
 
-        # Calculate the index within the target file
-        index_in_file = idx - self.cumulative_counts[file_idx]
+        try:
+            # Generate the key
+            key = str(idx).encode('utf-8')
 
-        # Check cache
-        if file_idx == self._cached_file_idx and self._cached_data is not None:
-            # print(f"Cache hit for file index {file_idx}") # Debugging
-            pass # Data is already cached
-        else:
-            # print(f"Cache miss. Loading file index {file_idx}: {self.file_paths[file_idx]}") # Debugging
-            # Load the file
-            target_file_path = self.file_paths[file_idx]
+            # Get value bytes from LMDB using the persistent transaction
+            value_bytes = self.txn.get(key)
+
+            # Check if key exists
+            if value_bytes is None:
+                # This ideally shouldn't happen if __len__ is correct and DB wasn't modified
+                raise KeyError(f"Key '{key.decode()}' not found in LMDB database {self.lmdb_path} for index {idx}")
+
+            # Deserialize value using pickle
+            # Use try-except for potential unpickling errors
             try:
-                self._cached_data = torch.load(target_file_path, map_location='cpu')
-                self._cached_file_idx = file_idx
-                # Basic validation after load
-                if not isinstance(self._cached_data, list) or len(self._cached_data) != self.item_counts[file_idx]:
-                     print(f"Warning: Data inconsistency loading {target_file_path}. Expected list of size {self.item_counts[file_idx]}, got {type(self._cached_data)} of size {len(self._cached_data) if isinstance(self._cached_data, list) else 'N/A'}.")
-                     # Attempt to recover if possible, otherwise raise or handle
-                     if not isinstance(self._cached_data, list) or index_in_file >= len(self._cached_data):
-                         raise RuntimeError(f"Cannot retrieve item {index_in_file} from corrupted/invalid file {target_file_path}")
-
+                data_dict = pickle.loads(value_bytes)
+            except pickle.UnpicklingError as e:
+                raise RuntimeError(f"Failed to unpickle data for key '{key.decode()}' at index {idx} in {self.lmdb_path}: {e}")
             except Exception as e:
-                # Clear cache on error and re-raise
-                self._cached_data = None
-                self._cached_file_idx = None
-                raise RuntimeError(f"Failed to load data file {target_file_path}: {e}")
+                raise RuntimeError(f"Unexpected error during unpickling for key '{key.decode()}' at index {idx}: {e}")
 
+            return data_dict
 
-        # Retrieve the specific item from the loaded (and now cached) data
-        try:
-            item_data = self._cached_data[index_in_file]
-            return item_data
-        except IndexError:
-             # This might happen if the file changed or initial count was wrong
-             raise IndexError(f"Internal Error: Calculated index {index_in_file} out of bounds for file {self.file_paths[file_idx]} which has {len(self._cached_data)} items.")
-        except TypeError:
-             # This might happen if _cached_data is not a list as expected
-              raise TypeError(f"Internal Error: Cached data for file {self.file_paths[file_idx]} is not a list.")
+        except lmdb.Error as e:
+            # Handle potential LMDB errors during .get()
+            raise RuntimeError(f"LMDB error retrieving key '{key.decode()}' for index {idx} from {self.lmdb_path}: {e}")
 
-# Example Usage (Optional: for testing)
-if __name__ == '__main__':
-    # Create a dummy directory and files for testing
-    dummy_dir = pathlib.Path("./dummy_precomputed_data")
-    dummy_dir.mkdir(exist_ok=True)
+    def close(self):
+        """Closes the LMDB environment if it's open."""
+        # print(f"Attempting to close LMDB environment: {self.lmdb_path}") # Debug
+        # No need for txn.abort() or commit() as it's read-only
+        self.txn = None # Clear transaction reference
+        if hasattr(self, 'env') and self.env:
+            try:
+                self.env.close()
+                # print(f"Closed LMDB environment: {self.lmdb_path}") # Debug
+                self.env = None # Prevent double closing
+            except Exception as e:
+                print(f"Error closing LMDB environment {self.lmdb_path}: {e}")
 
-    # Create dummy data (replace with actual structure if needed)
-    def create_dummy_item(idx):
-        return {
-            'stfts': {'mixture': {1024: (torch.randn(1, 100, 513), torch.randn(1, 100, 513), torch.randn(1, 100, 513))},
-                      'segment': {1024: (torch.randn(1, 100, 513), torch.randn(1, 100, 513), torch.randn(1, 100, 513))}},
-            'text': f'Dummy text {idx}',
-            'mixture_component_texts': [f'Dummy text {idx}', f'Noise text {idx+1}'],
-            'stft_common_params': {'hop_length': 256},
-            'stft_win_lengths': [1024]
-        }
+    def __del__(self):
+        """Attempt to close the LMDB environment when the object is deleted."""
+        self.close()
 
-    batch_0_data = [create_dummy_item(i) for i in range(10)]
-    torch.save(batch_0_data, dummy_dir / "batch_000000.pt")
+# Example Usage (Optional: for testing with LMDB)
+# This example would need modification to create a dummy LMDB database first.
+# if __name__ == '__main__':
+#     # 1. Create a dummy LMDB database (e.g., using code similar to precompute_stfts.py)
+#     dummy_lmdb_path = "./dummy_precomputed_data.lmdb"
+#     # ... code to populate dummy_lmdb_path ...
+#     print("Dummy LMDB data created.")
 
-    batch_1_data = [create_dummy_item(i) for i in range(10, 25)]
-    torch.save(batch_1_data, dummy_dir / "batch_000001.pt")
+#     # Initialize dataset
+#     try:
+#         # Use lock=False for typical DataLoader usage
+#         dataset = PrecomputedSTFTDataset(dummy_lmdb_path, lock=False)
+#         print(f"Dataset length: {len(dataset)}")
 
-    batch_2_data = [] # Empty file
-    torch.save(batch_2_data, dummy_dir / "batch_000002.pt")
+#         # Test __getitem__
+#         if len(dataset) > 0:
+#             print("Testing __getitem__:")
+#             item_0 = dataset[0]
+#             print(f"Item 0 text: {item_0.get('text')}")
+#             item_last = dataset[len(dataset) - 1]
+#             print(f"Last item ({len(dataset)-1}) text: {item_last.get('text')}")
 
-    batch_3_data = [create_dummy_item(i) for i in range(25, 30)]
-    torch.save(batch_3_data, dummy_dir / "batch_000003.pt")
+#         # Test index out of bounds
+#         try:
+#             dataset[len(dataset)]
+#         except IndexError as e:
+#             print(f"Successfully caught expected IndexError: {e}")
 
-    print("Dummy data created.")
+#         # Test with DataLoader
+#         if len(dataset) > 0:
+#             from torch.utils.data import DataLoader
+#             # num_workers > 0 requires lock=False usually
+#             dataloader = DataLoader(dataset, batch_size=4, shuffle=True, num_workers=2)
+#             print("Testing DataLoader iteration:")
+#             for i, batch in enumerate(dataloader):
+#                 print(f"Batch {i+1} size: {len(batch['text'])}")
+#                 if i >= 2: break
+#             print("DataLoader test finished.")
 
-    # Initialize dataset
-    try:
-        dataset = PrecomputedSTFTDataset(str(dummy_dir))
-        print(f"Dataset length: {len(dataset)}")
-
-        # Test __getitem__
-        if len(dataset) > 0:
-            print("Testing __getitem__:")
-            item_0 = dataset[0]
-            print(f"Item 0 text: {item_0.get('text')}")
-            item_10 = dataset[10] # Should be first item in second file
-            print(f"Item 10 text: {item_10.get('text')}")
-            item_24 = dataset[24] # Should be last item in second file
-            print(f"Item 24 text: {item_24.get('text')}")
-            item_25 = dataset[25] # Should be first item in fourth file (skipping empty file)
-            print(f"Item 25 text: {item_25.get('text')}")
-            item_last = dataset[len(dataset) - 1]
-            print(f"Last item ({len(dataset)-1}) text: {item_last.get('text')}")
-
-        # Test index out of bounds
-        try:
-            dataset[len(dataset)]
-        except IndexError as e:
-            print(f"Successfully caught expected IndexError: {e}")
-
-        # Test with DataLoader
-        if len(dataset) > 0:
-            from torch.utils.data import DataLoader
-            dataloader = DataLoader(dataset, batch_size=4, shuffle=True)
-            print("Testing DataLoader iteration:")
-            for i, batch in enumerate(dataloader):
-                print(f"Batch {i+1} size: {len(batch['text'])}")
-                # print(f"Batch {i+1} keys: {batch.keys()}")
-                # print(f"Batch {i+1} texts: {batch['text']}")
-                if i >= 2: # Print first few batches
-                    break
-            print("DataLoader test finished.")
-
-    except Exception as e:
-        print(f"An error occurred during testing: {e}")
-    finally:
-        # Clean up dummy files
-        import shutil
-        if dummy_dir.exists():
-             shutil.rmtree(dummy_dir)
-             print(f"Cleaned up dummy directory: {dummy_dir}") 
+#     except Exception as e:
+#         print(f"An error occurred during testing: {e}")
+#     finally:
+#         # Clean up dataset resources explicitly
+#         if 'dataset' in locals() and dataset:
+#             dataset.close()
+#         # Clean up dummy LMDB
+#         import shutil
+#         dummy_lmdb_dir = pathlib.Path(dummy_lmdb_path)
+#         if dummy_lmdb_dir.exists():
+#              shutil.rmtree(dummy_lmdb_dir)
+#              print(f"Cleaned up dummy LMDB directory: {dummy_lmdb_dir}") 
