@@ -525,9 +525,16 @@ class ResUNet30_Base(nn.Module, Base):
         )
 
         # Extract predicted mask components (same as original feature_maps_to_wav)
-        mask_mag = torch.sigmoid(x[:, 0, 0, 0, :, :]) # Indexing assumes target_sources=1, output_channels=1
+        # Ensure masks have shape (B, C, T, F) where C=1 for consistency
+        # Slice x (B, src=1, chan=1, K=3, T, F) -> (8, 1, 1, 3, 1024, 256)
+
+        # Slice K=0 for mag, squeeze src/chan dims, add C dim back -> (B, C=1, T, F)
+        mask_mag = torch.sigmoid(x[:, 0, 0, 0, :, :]).unsqueeze(1)
+
+        # Slice K=1, K=2 for phase masks -> (B, T, F)
         _mask_real = torch.tanh(x[:, 0, 0, 1, :, :])
         _mask_imag = torch.tanh(x[:, 0, 0, 2, :, :])
+
         _, mask_cos, mask_sin = magphase(_mask_real, _mask_imag)
         
         # Apply masks and mixture phase (same as original feature_maps_to_wav)
