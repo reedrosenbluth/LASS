@@ -7,6 +7,7 @@ import lightning.pytorch as pl
 from lightning.pytorch.strategies import DDPStrategy
 from lightning.pytorch.loggers import WandbLogger
 from torch.utils.tensorboard import SummaryWriter
+from datetime import datetime
 from data.datamodules import *
 from data.precomputed_stft_dataset import PrecomputedSTFTDataset
 from utils import create_logging, parse_yaml
@@ -124,17 +125,17 @@ def get_data_module(
         lock=False
     )
 
-    # val_dataset = PrecomputedSTFTDataset(
-    #     data_path=str(precomputed_val_path),
-    #     lock=False
-    # )
+    val_dataset = PrecomputedSTFTDataset(
+        data_path=str(precomputed_val_path),
+        lock=False
+    )
 
     # data module
     # IMPORTANT: Assumes DataModule accepts train_dataset and val_dataset arguments.
     # If your DataModule definition in data/datamodules.py is different, it needs modification.
     data_module = DataModule(
         train_dataset=train_dataset,
-        # val_dataset=val_dataset, # Added validation dataset
+        val_dataset=val_dataset,
         num_workers=num_workers,
         batch_size=batch_size
     )
@@ -249,10 +250,11 @@ def train(args) -> NoReturn:
         summary_writer = SummaryWriter(log_dir=tf_logs_dir)
 
         yaml_name = pathlib.Path(config_yaml).stem
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
 
         wandb_logger = WandbLogger(
             project="LASS",
-            name=f"{yaml_name}_devices{devices_num}",
+            name=f"{yaml_name}_devices{devices_num}_{timestamp}",
             save_dir=tf_logs_dir,
             log_model=True,
             config=configs,
@@ -274,7 +276,7 @@ def train(args) -> NoReturn:
             use_distributed_sampler=True,
             sync_batchnorm=sync_batchnorm,
             num_sanity_val_steps=2,
-            enable_checkpointing=False,
+            enable_checkpointing=True,
             enable_progress_bar=True,
             enable_model_summary=True,
         )
@@ -289,10 +291,8 @@ def train(args) -> NoReturn:
         )
 
     finally:
-        # Ensure datasets are closed properly after training/evaluation
         if data_module is not None:
             logging.info("Closing datasets...")
-            # Check if datasets exist before attempting to close
             if hasattr(data_module, 'train_dataset') and data_module.train_dataset:
                 try:
                     data_module.train_dataset.close()
@@ -311,7 +311,6 @@ def train(args) -> NoReturn:
 
 
 if __name__ == "__main__":
-
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--workspace", type=str, required=True, help="Directory of workspace."

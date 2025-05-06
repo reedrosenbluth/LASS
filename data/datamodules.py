@@ -10,6 +10,7 @@ class DataModule(pl.LightningDataModule):
     def __init__(
         self,
         train_dataset: object,
+        val_dataset: object,
         batch_size: int,
         num_workers: int
     ):
@@ -31,6 +32,7 @@ class DataModule(pl.LightningDataModule):
         """
         super().__init__()
         self._train_dataset = train_dataset
+        self._val_dataset = val_dataset
         self.num_workers = num_workers
         self.batch_size = batch_size
         self.collate_fn = precomputed_stft_collate_fn
@@ -51,6 +53,7 @@ class DataModule(pl.LightningDataModule):
         # On multiple devices, each SegmentSampler samples a part of mini-batch
         # data.
         self.train_dataset = self._train_dataset
+        self.val_dataset = self._val_dataset
         
         
     def train_dataloader(self) -> torch.utils.data.DataLoader:
@@ -67,10 +70,19 @@ class DataModule(pl.LightningDataModule):
 
         return train_loader
 
-    def val_dataloader(self):
-        # val_split = Dataset(...)
-        # return DataLoader(val_split)
-        pass
+    def val_dataloader(self) -> torch.utils.data.DataLoader:
+        r"""Get val loader."""
+        val_loader = DataLoader(
+            dataset=self.val_dataset,
+            batch_size=self.batch_size,
+            collate_fn=self.collate_fn,
+            num_workers=self.num_workers,
+            pin_memory=True,
+            persistent_workers=False,
+            shuffle=False
+        )
+
+        return val_loader
 
     def test_dataloader(self):
         # test_split = Dataset(...)
