@@ -262,8 +262,8 @@ def train(args) -> NoReturn:
 
         trainer = pl.Trainer(
             accelerator='auto',
-            devices='auto',
-            strategy='ddp_find_unused_parameters_true',
+            devices=1,
+            strategy='auto',
             num_nodes=num_nodes,
             precision="32-true",
             logger=wandb_logger,
