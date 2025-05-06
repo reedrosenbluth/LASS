@@ -17,7 +17,8 @@ class PrecomputedSTFTDataset(Dataset):
     """
     def __init__(self, data_path: str, lock: bool = False):
         """
-        Initializes the dataset by opening the LMDB environment.
+        Initializes the dataset by storing LMDB path and fetching total item count.
+        The LMDB environment itself is opened lazily per worker.
 
         Args:
             data_path (str): Path to the LMDB database directory (e.g., /path/to/train.lmdb).
@@ -25,10 +26,11 @@ class PrecomputedSTFTDataset(Dataset):
                          multi-process DataLoader workers, True if unsure or single process.
         """
         self.lmdb_path = pathlib.Path(data_path)
+        self.lock = lock  # Store lock setting for lazy opening
         self.env: Optional[lmdb.Environment] = None
-        self.txn: Optional[lmdb.Transaction] = None # Initialize txn to None
+        self.txn: Optional[lmdb.Transaction] = None
         self.total_items: int = 0
-        # self._init_lock = threading.Lock() # Lock likely not needed if txn is per-worker
+        # self.pid = os.getpid() # Can be useful for debugging
 
         if not self.lmdb_path.exists() or not self.lmdb_path.is_dir():
             # LMDB often creates a directory. Check if the parent exists if path is file-like
@@ -37,69 +39,75 @@ class PrecomputedSTFTDataset(Dataset):
             else:
                  raise FileNotFoundError(f"LMDB directory not found at: {data_path}")
 
+        # Get total_items once. This requires opening and closing the env.
+        # Workers will rely on this stored value and open their own envs later.
         try:
-            # Open the LMDB environment (read-only)
-            # This happens in the main process before workers are created.
-            self.env = lmdb.open(
+            temp_env = lmdb.open(
                 str(self.lmdb_path),
                 readonly=True,
-                lock=lock,         # Set based on arg - IMPORTANT for DataLoader!
-                readahead=False,   # Generally False for random access
-                meminit=False,     # Don't initialize map in read-only
-                max_readers=126    # Default, adjust if needed
+                lock=self.lock, # Use the lock setting
+                readahead=False,
+                meminit=False,
+                max_readers=1 # Only one reader needed for this temporary operation
             )
-
-            if self.env is None:
-                 raise IOError(f"LMDB environment is None after opening {self.lmdb_path}")
-
-            # Get total number of items from LMDB stats
-            with self.env.begin(write=False) as txn_stat:
-                self.total_items = txn_stat.stat()['entries']
-
-            print(f"Opened LMDB: {self.lmdb_path}. Found {self.total_items} items.")
-
-            # --- DO NOT Create a persistent read transaction here --- #
-            # Let each worker create its own transaction in __getitem__
-            # self._reopen_transaction() # REMOVED
-
+            if temp_env is None:
+                 raise IOError(f"LMDB environment is None after temp opening {self.lmdb_path} to get count.")
+            with temp_env.begin(write=False) as temp_txn:
+                self.total_items = temp_txn.stat()['entries']
+            temp_env.close()
+            # print(f"Main process {os.getpid()}: Fetched total_items = {self.total_items} from {self.lmdb_path}") # Debug
         except lmdb.Error as e:
-             raise IOError(f"Failed to open LMDB environment at {self.lmdb_path}. Error: {e}")
+             raise IOError(f"Failed to open LMDB environment temporarily to get item count from {self.lmdb_path}. Error: {e}")
         except Exception as e:
             # Catch other potential errors during init
-             if self.env:
-                 self.env.close()
-             raise IOError(f"Error initializing PrecomputedSTFTDataset: {e}")
+             raise IOError(f"Error initializing PrecomputedSTFTDataset (getting count): {e}")
 
-    def _reopen_transaction(self):
-        """Helper to open/reopen the read transaction for the current process."""
-        if self.txn:
-            # If called again in the same worker, maybe just return?
-            # Or abort and reopen? For read-only, it might be okay to reuse.
-             return # Assume existing transaction is valid for this worker
+    def _ensure_env_open(self):
+        """Ensures the LMDB environment is open for the current process."""
+        if self.env is None:
+            # print(f"Worker {os.getpid()} (original PID: {self.pid}): Lazily opening LMDB env: {self.lmdb_path}") # Debug
+            try:
+                self.env = lmdb.open(
+                    str(self.lmdb_path),
+                    readonly=True,
+                    lock=self.lock,      # Use the stored lock setting
+                    readahead=False,
+                    meminit=False,
+                    max_readers=126     # Default, or adjust if many workers
+                )
+                if self.env is None:
+                    raise IOError(f"LMDB environment is None after opening {self.lmdb_path} in worker {os.getpid()}")
+                # print(f"Worker {os.getpid()}: Successfully opened LMDB env.") # Debug
+            except lmdb.Error as e:
+                raise IOError(f"Failed to open LMDB environment at {self.lmdb_path} in worker {os.getpid()}. Error: {e}")
 
-        if self.env:
-             try:
-                 # Create a new transaction for this worker
-                 self.txn = self.env.begin(write=False)
-                 # print(f"Worker {os.getpid()}: Opened new read transaction for {self.lmdb_path}") # Debug
-             except lmdb.Error as e:
-                 print(f"Error creating read transaction for {self.lmdb_path} in worker {os.getpid()}: {e}")
-                 self.txn = None # Ensure txn is None on failure
-                 raise # Re-raise error, likely indicates environment issue
-        else:
-             # This shouldn't happen if __init__ succeeded
-             print("Warning: Cannot create transaction, LMDB environment is not open.")
-             self.txn = None
-             raise RuntimeError("LMDB environment is not available when trying to create transaction.")
+    def _ensure_transaction_open(self):
+        """Ensures an LMDB read transaction is open for the current process."""
+        self._ensure_env_open()  # Make sure env is open first for this process/worker
+
+        if self.txn is None: # Check if txn is None for this specific worker
+            if self.env: # Env should now be open
+                try:
+                    # Create a new transaction for this worker
+                    self.txn = self.env.begin(write=False)
+                    # print(f"Worker {os.getpid()}: Opened new read transaction.") # Debug
+                except lmdb.Error as e:
+                    print(f"Error creating read transaction for {self.lmdb_path} in worker {os.getpid()}: {e}")
+                    self.txn = None 
+                    raise # Re-raise error
+            else:
+                # This shouldn't happen if _ensure_env_open succeeded
+                raise RuntimeError(f"LMDB environment is not available when trying to create transaction in worker {os.getpid()}.")
+
 
     def __len__(self) -> int:
         """Returns the total number of items in the dataset."""
         return self.total_items
 
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
+    def __getitem__(self, idx: int) -> Optional[Dict[str, Any]]:
         """
         Retrieves the precomputed data for the item at the given index from LMDB.
-        Ensures an LMDB transaction is available for the current worker process.
+        Ensures an LMDB environment and transaction are available for the current worker process.
 
         Args:
             idx (int): The index of the item to retrieve.
@@ -116,17 +124,17 @@ class PrecomputedSTFTDataset(Dataset):
         if not 0 <= idx < self.total_items:
             raise IndexError(f"Index {idx} out of bounds for dataset with size {self.total_items}")
 
-        # --- Ensure transaction exists for this worker process --- #
-        if self.txn is None:
-            # First time __getitem__ is called in this worker, create a transaction.
-            # Rely on _reopen_transaction to handle env checks and errors.
-            self._reopen_transaction()
-            # If it failed, _reopen_transaction would have raised an error.
+        # --- Ensure transaction (and thus env) is open for this worker process --- #
+        try:
+            self._ensure_transaction_open()
+        except Exception as e:
+            # print(f"Worker {os.getpid()}: Error ensuring transaction open for idx {idx}. Error: {e}") # Debug
+            # Could return None or raise. Raising is better for diagnosing hangs.
+            raise RuntimeError(f"Worker {os.getpid()}: Failed to ensure LMDB transaction for index {idx}: {e}") from e
 
-        # Now self.txn should be valid for this worker
+
         if self.txn is None:
-             # Safety check in case _reopen_transaction logic changes
-             raise RuntimeError(f"LMDB transaction failed to initialize for index {idx}.")
+             raise RuntimeError(f"LMDB transaction failed to initialize for index {idx} in worker {os.getpid()}.")
 
         try:
             # Generate the key
@@ -137,39 +145,46 @@ class PrecomputedSTFTDataset(Dataset):
 
             # Check if key exists
             if value_bytes is None:
+                # print(f"Worker {os.getpid()}: Key '{key.decode()}' not found for index {idx}") # Debug
+                # Depending on dataset leniency, could return None or raise.
+                # For debugging hangs, it's better to be strict.
                 raise KeyError(f"Key '{key.decode()}' not found in LMDB database {self.lmdb_path} for index {idx}")
 
             # Deserialize value using pickle
             try:
                 data_dict = pickle.loads(value_bytes)
             except pickle.UnpicklingError as e:
+                # print(f"Worker {os.getpid()}: Unpickling error for key '{key.decode()}' at index {idx}. Error: {e}") # Debug
                 raise RuntimeError(f"Failed to unpickle data for key '{key.decode()}' at index {idx} in {self.lmdb_path}: {e}") from e
-            except Exception as e:
+            except Exception as e: # Catch other unpickling related errors
+                # print(f"Worker {os.getpid()}: Generic unpickling error for key '{key.decode()}' at index {idx}. Error: {e}") # Debug
                 raise RuntimeError(f"Unexpected error during unpickling for key '{key.decode()}' at index {idx}: {e}") from e
 
             return data_dict
 
         except lmdb.Error as e:
             # Handle potential LMDB errors during .get()
-            # You might want more specific error handling here (e.g., retry?)
-            raise RuntimeError(f"LMDB error retrieving key '{key.decode()}' for index {idx} from {self.lmdb_path}: {e}") from e
+            # print(f"Worker {os.getpid()}: LMDB error for key '{key.decode()}' at index {idx}. Error: {e}") # Debug
+            raise RuntimeError(f"LMDB error retrieving key '{key.decode()}' for index {idx} from {self.lmdb_path} in worker {os.getpid()}: {e}") from e
         except Exception as e:
             # Catch other unexpected errors during item retrieval
-            raise RuntimeError(f"Unexpected error retrieving item {idx}: {e}") from e
+            # print(f"Worker {os.getpid()}: Unexpected error for item {idx}. Error: {e}") # Debug
+            raise RuntimeError(f"Unexpected error retrieving item {idx} in worker {os.getpid()}: {e}") from e
 
     def close(self):
-        """Closes the LMDB environment if it's open."""
-        # Note: Transactions are tied to processes. Closing the env in the main
-        # process won't close transactions in workers. Workers exit naturally.
-        # print(f"Attempting to close LMDB environment: {self.lmdb_path}") # Debug
-        self.txn = None # Clear transaction reference in this process
+        """Closes the LMDB transaction and environment if they are open for this process."""
+        # print(f"Worker {os.getpid()}: Attempting to close LMDB transaction and environment: {self.lmdb_path}") # Debug
+        if hasattr(self, 'txn') and self.txn:
+            # LMDB read transactions don't strictly need explicit closing with .abort()
+            # but setting to None is good practice.
+            self.txn = None
         if hasattr(self, 'env') and self.env:
             try:
                 self.env.close()
-                # print(f"Closed LMDB environment: {self.lmdb_path}") # Debug
+                # print(f"Worker {os.getpid()}: Closed LMDB environment: {self.lmdb_path}") # Debug
                 self.env = None # Prevent double closing
             except Exception as e:
-                print(f"Error closing LMDB environment {self.lmdb_path}: {e}")
+                print(f"Error closing LMDB environment {self.lmdb_path} in worker {os.getpid()}: {e}")
 
     def __del__(self):
         """Attempt to close the LMDB environment when the object is deleted."""
