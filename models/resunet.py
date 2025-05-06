@@ -434,13 +434,14 @@ class ResUNet30_Base(nn.Module, Base):
         init_layer(self.pre_conv)
         init_layer(self.after_conv)
 
-    def forward(self, stft_magnitude, cos_in, sin_in, film_dict):
+    def forward(self, stft_magnitude, cos_in, sin_in, film_dict, target_length: int):
         """
         Args:
           stft_magnitude: Mixture magnitude (batch_size, channels_num, time_steps, freq_bins)
           cos_in: Mixture phase cosine (batch_size, channels_num, time_steps, freq_bins)
           sin_in: Mixture phase sine (batch_size, channels_num, time_steps, freq_bins)
           film_dict: Dictionary containing FiLM modulation parameters.
+          target_length: Target length of the waveform
 
         Outputs:
           output_dict: {
@@ -577,10 +578,11 @@ class ResUNet30_Base(nn.Module, Base):
         # Option 2: Estimate length from T_orig * hop_size? Risky.
         # Let's assume original_length is needed. For now, use T_orig * hop_size as placeholder.
         # TODO: Pass actual original waveform length for accurate iSTFT
-        estimated_audio_length = origin_len * self.istft.hop_length
+        # estimated_audio_length = origin_len * self.istft.hop_length
+        # Use the provided target_length instead
 
         # Perform ISTFT
-        waveform_padded_time = self.istft(out_real, out_imag, estimated_audio_length) # Uses padded T
+        waveform_padded_time = self.istft(out_real, out_imag, target_length) # Uses target length
 
         # Reshape and potentially trim ISTFT output (ISTFT handles length)
         waveform = waveform_padded_time.reshape(
@@ -637,7 +639,7 @@ class ResUNet30(nn.Module):
         )
 
 
-    def forward(self, input_dict):
+    def forward(self, input_dict, target_waveform):
         # Extract mixture STFT components and condition
         stft_mixture_mag = input_dict['stft_mixture_mag']
         stft_mixture_cos = input_dict['stft_mixture_cos']
@@ -648,12 +650,16 @@ class ResUNet30(nn.Module):
             conditions=conditions,
         )
 
-        # Pass magnitude and phase to base model
+        # Get target length
+        target_length = target_waveform.shape[-1]
+
+        # Pass magnitude, phase, and target_length to base model
         output_dict = self.base(
             stft_magnitude=stft_mixture_mag,
             cos_in=stft_mixture_cos,
             sin_in=stft_mixture_sin,
             film_dict=film_dict,
+            target_length=target_length, # Pass target length
         )
 
         return output_dict

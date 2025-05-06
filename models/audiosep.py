@@ -159,7 +159,7 @@ class AudioSep(pl.LightningModule, PyTorchModelHubMixin):
         }
 
         self.ss_model.train()
-        sep_waveform = self.ss_model(input_dict)['waveform']
+        sep_waveform = self.ss_model(input_dict, target_waveform=target_waveforms)['waveform']
         sep_waveform = sep_waveform.squeeze(1)
 
         output_dict = {
