@@ -40,83 +40,72 @@ class AudioSep(pl.LightningModule, PyTorchModelHubMixin):
         self.lr_lambda_func = lr_lambda_func
 
     
-    def training_step(self, batch_data_dict, batch_idx):
+    def training_step(self, batch_data_dict: Dict[str, Any], batch_idx: int):
         """
-        Forward a mini-batch, compute loss, and back-prop.
+        Forward one mini-batch, compute loss, and back-prop.
 
         Expected keys in `batch_data_dict`
-        ├─ 'text'                    : List[str]                (positive caption)
-        ├─ 'mixture_component_texts': List[List[str]]  (optional, 2nd item ⇒ negative caption)
-        ├─ 'stfts'                  : nested dict with 'mixture' / 'segment' tensors
-        ├─ 'stft_win_lengths'       : list[Tensor]  (window-lengths present)
-        └─ 'target_waveform'        : Tensor (B,1,T)
+        ├─ 'text'                     : List[str]                 (positive captions)
+        ├─ 'mixture_component_texts'  : List[List[str]] (optional – 2nd elt ⇒ negative caption)
+        ├─ 'stfts'                    : nested dict  (see pre-compute code)
+        ├─ 'stft_win_lengths'         : collated win-lengths
+        └─ 'target_waveform'          : Tensor (B,1,T)
         """
         
         random.seed(batch_idx)
 
-        
-        #OSITIVE + NEGATIVE CAPTIONS
-       
+        # ----------- 1) POS / NEG captions --------------------------------
         pos_caps: list[str] = batch_data_dict["text"]
 
-        mix_lists = batch_data_dict.get("mixture_component_texts")  # may be None
-        neg_caps: list[str] = []
-
-        if mix_lists is None:                       # field absent entirely
+        mix_lists = batch_data_dict.get("mixture_component_texts")  # can be missing
+        if mix_lists is None:
             neg_caps = [""] * len(pos_caps)
         else:
-            for lst in mix_lists:
-                if isinstance(lst, (list, tuple)) and len(lst) > 1:
-                    neg_caps.append(lst[1])         # take 2nd sentence
-                else:
-                    neg_caps.append("")             # fallback: empty
-
-            # safety – keep lengths aligned with positive captions
+            neg_caps = [
+                lst[1] if isinstance(lst, (list, tuple)) and len(lst) > 1 else ""
+                for lst in mix_lists
+            ]
+            # keep list length aligned
             if len(neg_caps) != len(pos_caps):
                 neg_caps = (neg_caps + [""] * len(pos_caps))[: len(pos_caps)]
 
-       
+        # ----------- 2) pick the STFT (fixed 512-win) ---------------------
         batch_stfts          = batch_data_dict["stfts"]
         stft_win_lengths_raw = batch_data_dict["stft_win_lengths"]
         target_waveforms     = batch_data_dict["target_waveform"]
 
-        # reconstruct *available* window-length list from collated structure
-        if (isinstance(stft_win_lengths_raw, list) and
-            all(isinstance(t, torch.Tensor) for t in stft_win_lengths_raw)):
+        # reconstruct available win-lengths from the collated structure
+        if (isinstance(stft_win_lengths_raw, list)
+            and all(isinstance(t, torch.Tensor) for t in stft_win_lengths_raw)):
             available_lengths = [int(t[0].item()) for t in stft_win_lengths_raw]
-        elif (isinstance(stft_win_lengths_raw, list) and
-              len(stft_win_lengths_raw) == 1 and
-              isinstance(stft_win_lengths_raw[0], list)):
+        elif (isinstance(stft_win_lengths_raw, list)
+              and len(stft_win_lengths_raw) == 1
+              and isinstance(stft_win_lengths_raw[0], list)):
             available_lengths = stft_win_lengths_raw[0]
         elif all(isinstance(l, int) for l in stft_win_lengths_raw):
             available_lengths = stft_win_lengths_raw
         else:
-            raise TypeError("Cannot parse 'stft_win_lengths' from dataloader.")
+            raise TypeError("Cannot parse 'stft_win_lengths' in batch.")
 
         desired_win_len = 512
         if desired_win_len not in available_lengths:
-            raise ValueError(
-                f"Desired window length {desired_win_len} not found "
-                f"in {available_lengths}"
-            )
+            raise ValueError(f"Window {desired_win_len} missing – got {available_lengths}")
 
         mixture_mag, mixture_cos, mixture_sin = batch_stfts["mixture"][desired_win_len]
 
-        
-        # CONDITION EMBEDDING  (CLAP w/ positive + negative captions)
-    
+        # ----------- 3) condition embedding (CLAP pos+neg) ----------------
         if self.query_encoder_type == "CLAP":
             conditions = self.query_encoder.get_query_embed(
                 modality="text",
                 text=pos_caps,
-                text_neg=neg_caps,
+                text_neg=neg_caps,   # ← negative captions integrated
             )
         else:
             raise NotImplementedError(
                 f"Query encoder '{self.query_encoder_type}' not supported."
             )
 
-    
+        # ----------- 4) separation forward + loss -------------------------
         input_dict = {
             "stft_mixture_mag": mixture_mag,
             "stft_mixture_cos": mixture_cos,
@@ -126,11 +115,12 @@ class AudioSep(pl.LightningModule, PyTorchModelHubMixin):
         target_dict = {"waveform": target_waveforms.squeeze(1)}
 
         self.ss_model.train()
-        sep_waveform = self.ss_model(input_dict)["waveform"].squeeze(1)
+        sep_waveform = self.ss_model(input_dict, target_waveform=target_waveforms)["waveform"].squeeze(1)
 
         loss = self.loss_function({"waveform": sep_waveform}, target_dict)
         self.log_dict({"train_loss": loss})
         return loss
+
 
 
     def forward(self, *args, **kwargs):
