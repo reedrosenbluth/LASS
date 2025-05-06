@@ -6,7 +6,7 @@ def l1(output, target):
 
 
 def l1_wav(output_dict, target_dict):
-	return l1(output_dict['segment'], target_dict['segment'])
+	return l1(output_dict['waveform'], target_dict['waveform'])
 
 
 def get_loss_function(loss_type):

@@ -25,24 +25,11 @@
 - Skip the STFT computation in the model when using precomputed data
 - Update configuration files to support the new workflow
 
-## Implementation Details
+## Next Steps / Considerations (Post Initial Implementation)
 
-### Precomputation Script Structure
-```python
-# scripts/precompute_stfts.py
-# - Load audio from AudioTextDataset
-# - Generate mixtures using SegmentMixer
-# - Compute STFTs for segments and mixtures
-# - Save to disk in an efficient format
-```
-
-### Precomputed Dataset Structure
-```python
-# data/precomputed_stft_dataset.py
-# - Load precomputed STFTs
-# - Return formatted data dictionaries ready for model input
-```
-
-### Training Updates
-- Modify model to accept precomputed STFTs
-- Update YAML config to control use of precomputed data
+1.  **Adapt Base Model (`ss_model`, e.g., `ResUNet30`):** Modify the core separation model (`models/resunet.py`) to accept STFT magnitude inputs (key: `stft_mixture`) and output STFT magnitude (key: `stft_waveform`).
+2.  **Update Loss Configuration:** Change `loss_type` in `config/audiosep_base.yaml` from `l1_wav` to an STFT-compatible loss (e.g., `l1_stft_mag`). Decide whether to keep the loss hardcoded in `AudioSep.training_step` or make it configurable via `get_loss_function` again.
+3.  **Handle Multiple STFT Window Lengths:** Review the logic in `AudioSep.training_step` that selects the first window length (`selected_win_len = stft_win_lengths[0]`). Adjust if specific selection or combination logic is needed when multiple window lengths are precomputed.
+4.  **Verify DataLoader Collation:** Check the exact structure of `batch_data_dict` produced by the `DataLoader` in `AudioSep.training_step`. Implement a custom `collate_fn` if the default collation doesn't match the expected structure for accessing STFTs, text, etc.
+5.  **Implement Validation/Testing:** Add STFT-based processing logic to the `test_step` method in `AudioSep` if validation or testing with precomputed data is required.
+6.  **Set Precomputed Data Path:** Ensure the `precomputed_stft_dir` value in `config/audiosep_base.yaml` points to the correct location of the generated STFT data before running training.

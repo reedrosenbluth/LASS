@@ -8,11 +8,11 @@ from lightning.pytorch.strategies import DDPStrategy
 from lightning.pytorch.loggers import WandbLogger
 from torch.utils.tensorboard import SummaryWriter
 from data.datamodules import *
+from data.precomputed_stft_dataset import PrecomputedSTFTDataset
 from utils import create_logging, parse_yaml
 from models.resunet import *
 from losses import get_loss_function
 from models.audiosep import AudioSep, get_model_class
-from data.waveform_mixers import SegmentMixer
 from models.clap_encoder import CLAP_Encoder
 from callbacks.base import CheckpointEveryNSteps
 from optimizers.lr_schedulers import get_lr_lambda
@@ -91,22 +91,12 @@ def get_data_module(
     num_workers: int,
     batch_size: int,
 ) -> DataModule:
-    r"""Create data_module. Mini-batch data can be obtained by:
-
-    code-block:: python
-
-        data_module.setup()
-
-        for batch_data_dict in data_module.train_dataloader():
-            print(batch_data_dict.keys())
-            break
+    r"""Create data_module using PrecomputedSTFTDataset with LMDB.
 
     Args:
-        workspace: str
         config_yaml: str
-        num_workers: int, e.g., 0 for non-parallel and 8 for using cpu cores
-            for preparing data in parallel
-        distributed: bool
+        num_workers: int
+        batch_size: int
 
     Returns:
         data_module: DataModule
@@ -114,23 +104,37 @@ def get_data_module(
 
     # read configurations
     configs = parse_yaml(config_yaml)
-    sampling_rate = configs['data']['sampling_rate']
-    segment_seconds = configs['data']['segment_seconds']
-    
-    # audio-text datasets
-    datafiles = configs['data']['datafiles']
-    
-    # dataset
-    dataset = AudioTextDataset(
-        datafiles=datafiles, 
-        sampling_rate=sampling_rate, 
-        max_clip_len=segment_seconds,
+    precomputed_stft_dir = configs['data'].get('precomputed_stft_dir', None)
+
+    logging.info("Using precomputed STFT dataset from LMDB.")
+    if not precomputed_stft_dir:
+        raise ValueError("Config key 'data.precomputed_stft_dir' must be set (base directory containing train.lmdb and val.lmdb).")
+
+    base_lmdb_path = pathlib.Path(precomputed_stft_dir)
+    precomputed_train_path = base_lmdb_path / "train.lmdb"
+    precomputed_val_path = base_lmdb_path / "val.lmdb"
+
+    logging.info(f"Loading precomputed training data from LMDB: {precomputed_train_path}")
+    logging.info(f"Loading precomputed validation data from LMDB: {precomputed_val_path}")
+
+    # Instantiate the precomputed datasets for training and validation
+    # lock=False is recommended for multi-worker DataLoaders
+    train_dataset = PrecomputedSTFTDataset(
+        data_path=str(precomputed_train_path),
+        lock=False
     )
-    
-    
+
+    # val_dataset = PrecomputedSTFTDataset(
+    #     data_path=str(precomputed_val_path),
+    #     lock=False
+    # )
+
     # data module
+    # IMPORTANT: Assumes DataModule accepts train_dataset and val_dataset arguments.
+    # If your DataModule definition in data/datamodules.py is different, it needs modification.
     data_module = DataModule(
-        train_dataset=dataset,
+        train_dataset=train_dataset,
+        # val_dataset=val_dataset, # Added validation dataset
         num_workers=num_workers,
         batch_size=batch_size
     )
@@ -155,12 +159,6 @@ def train(args) -> NoReturn:
     devices_num = torch.cuda.device_count()
     # Read config file.
     configs = parse_yaml(config_yaml)
-
-    # Configuration of data
-    max_mix_num = configs['data']['max_mix_num']
-    sampling_rate = configs['data']['sampling_rate']
-    lower_db = configs['data']['loudness_norm']['lower_db']
-    higher_db = configs['data']['loudness_norm']['higher_db']
 
     # Configuration of the separation model
     query_net = configs['model']['query_net']
@@ -196,102 +194,120 @@ def train(args) -> NoReturn:
     logging.info(configs)
 
     # data module
-    data_module = get_data_module(
-        config_yaml=config_yaml,
-        batch_size=batch_size,
-        num_workers=num_workers,
-    )
-    
-    # model
-    Model = get_model_class(model_type=model_type)
+    data_module = None # Initialize
+    try:
+        data_module = get_data_module(
+            config_yaml=config_yaml,
+            batch_size=batch_size,
+            num_workers=num_workers,
+        )
+        
+        # model
+        Model = get_model_class(model_type=model_type)
 
-    ss_model = Model(
-        input_channels=input_channels,
-        output_channels=output_channels,
-        condition_size=condition_size,
-    )
+        ss_model = Model(
+            input_channels=input_channels,
+            output_channels=output_channels,
+            condition_size=condition_size,
+        )
 
-    # loss function
-    loss_function = get_loss_function(loss_type)
+        # loss function
+        loss_function = get_loss_function(loss_type)
 
-    segment_mixer = SegmentMixer(
-        max_mix_num=max_mix_num,
-        lower_db=lower_db, 
-        higher_db=higher_db
-    )
+        # SegmentMixer is no longer needed as mixing/STFT is precomputed
+        segment_mixer = None 
+        logging.info("SegmentMixer skipped as precomputed STFTs are used.")
 
-    
-    if query_net == 'CLAP':
-        query_encoder = CLAP_Encoder()
-    else:
-        raise NotImplementedError
+        
+        if query_net == 'CLAP':
+            query_encoder = CLAP_Encoder()
+        else:
+            raise NotImplementedError
 
-    lr_lambda_func = get_lr_lambda(
-        lr_lambda_type=lr_lambda_type,
-        warm_up_steps=warm_up_steps,
-        reduce_lr_steps=reduce_lr_steps,
-    )
+        lr_lambda_func = get_lr_lambda(
+            lr_lambda_type=lr_lambda_type,
+            warm_up_steps=warm_up_steps,
+            reduce_lr_steps=reduce_lr_steps,
+        )
 
-    # pytorch-lightning model
-    pl_model = AudioSep(
-        ss_model=ss_model,
-        waveform_mixer=segment_mixer,
-        query_encoder=query_encoder,
-        loss_function=loss_function,
-        optimizer_type=optimizer_type,
-        learning_rate=learning_rate,
-        lr_lambda_func=lr_lambda_func,
-        use_text_ratio=use_text_ratio
-    )
+        # pytorch-lightning model
+        pl_model = AudioSep(
+            ss_model=ss_model,
+            query_encoder=query_encoder,
+            loss_function=loss_function,
+            optimizer_type=optimizer_type,
+            learning_rate=learning_rate,
+            lr_lambda_func=lr_lambda_func,
+            use_text_ratio=use_text_ratio,
+        )
 
-    checkpoint_every_n_steps = CheckpointEveryNSteps(
-        checkpoints_dir=checkpoints_dir,
-        save_step_frequency=save_step_frequency,
-    )
+        checkpoint_every_n_steps = CheckpointEveryNSteps(
+            checkpoints_dir=checkpoints_dir,
+            save_step_frequency=save_step_frequency,
+        )
 
-    summary_writer = SummaryWriter(log_dir=tf_logs_dir)
+        summary_writer = SummaryWriter(log_dir=tf_logs_dir)
 
-    yaml_name = pathlib.Path(config_yaml).stem
+        yaml_name = pathlib.Path(config_yaml).stem
 
-    wandb_logger = WandbLogger(
-        project="LASS",
-        name=f"{yaml_name}_devices{devices_num}",
-        save_dir=tf_logs_dir,
-        log_model=True,
-        config=configs,
-    )
+        wandb_logger = WandbLogger(
+            project="LASS",
+            name=f"{yaml_name}_devices{devices_num}",
+            save_dir=tf_logs_dir,
+            log_model=True,
+            config=configs,
+        )
 
-    callbacks = [checkpoint_every_n_steps]
+        callbacks = [checkpoint_every_n_steps]
 
-    trainer = pl.Trainer(
-        accelerator='auto',
-        devices='auto',
-        strategy='ddp_find_unused_parameters_true',
-        num_nodes=num_nodes,
-        precision="32-true",
-        logger=wandb_logger,
-        callbacks=callbacks,
-        fast_dev_run=False,
-        max_epochs=-1,
-        log_every_n_steps=50,
-        use_distributed_sampler=True,
-        sync_batchnorm=sync_batchnorm,
-        num_sanity_val_steps=2,
-        enable_checkpointing=False,
-        enable_progress_bar=True,
-        enable_model_summary=True,
-    )
+        trainer = pl.Trainer(
+            accelerator='auto',
+            devices=1,
+            strategy='single_device',
+            num_nodes=num_nodes,
+            precision="32-true",
+            logger=wandb_logger,
+            callbacks=callbacks,
+            fast_dev_run=False,
+            max_epochs=-1,
+            log_every_n_steps=50,
+            use_distributed_sampler=True,
+            sync_batchnorm=sync_batchnorm,
+            num_sanity_val_steps=2,
+            enable_checkpointing=False,
+            enable_progress_bar=True,
+            enable_model_summary=True,
+        )
 
-    # Fit, evaluate, and save checkpoints.
-    trainer.fit(
-        model=pl_model, 
-        train_dataloaders=None,
-        val_dataloaders=None,
-        datamodule=data_module,
-        ckpt_path=resume_checkpoint_path,
-    )
+        # Fit, evaluate, and save checkpoints.
+        trainer.fit(
+            model=pl_model, 
+            train_dataloaders=None,
+            val_dataloaders=None,
+            datamodule=data_module,
+            ckpt_path=resume_checkpoint_path,
+        )
 
-    wandb.finish()
+    finally:
+        # Ensure datasets are closed properly after training/evaluation
+        if data_module is not None:
+            logging.info("Closing datasets...")
+            # Check if datasets exist before attempting to close
+            if hasattr(data_module, 'train_dataset') and data_module.train_dataset:
+                try:
+                    data_module.train_dataset.close()
+                    logging.info("Closed training dataset.")
+                except Exception as e:
+                    logging.error(f"Error closing training dataset: {e}")
+            if hasattr(data_module, 'val_dataset') and data_module.val_dataset:
+                 try:
+                    data_module.val_dataset.close()
+                    logging.info("Closed validation dataset.")
+                 except Exception as e:
+                    logging.error(f"Error closing validation dataset: {e}")
+        
+        if wandb.run:
+             wandb.finish()
 
 
 if __name__ == "__main__":

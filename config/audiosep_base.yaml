@@ -20,6 +20,10 @@ data:
     stft_pad_mode: 'reflect'
     stft_win_lengths: [256, 512, 2048]
 
+    # Directory containing precomputed STFTs (train/ and val/ subdirs expected)
+    # Must be set if using this config for training.
+    precomputed_stft_dir: "/path/to/your/precomputed_stfts" # Example value
+
 model:
     query_net: CLAP
     condition_size: 512

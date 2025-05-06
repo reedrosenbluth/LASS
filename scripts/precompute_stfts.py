@@ -8,6 +8,8 @@ import json
 import random
 import threading
 import queue
+import torchaudio
+import torchaudio.transforms as T
 from torch.utils.data import DataLoader
 from torch.utils.data.dataloader import default_collate
 from torchlibrosa.stft import STFT, magphase
@@ -56,6 +58,64 @@ def calculate_stft_components(waveform, n_fft, hop_length, win_length, window, c
     sin_phase = sin_phase.contiguous()
 
     return magnitude, cos_phase, sin_phase
+
+def load_single_waveform(file_path, target_sr, max_clip_len_seconds, device):
+    """
+    Loads, resamples, converts to mono, and trims/pads a single audio file.
+
+    Args:
+        file_path (str or pathlib.Path): Path to the audio file.
+        target_sr (int): Target sampling rate.
+        max_clip_len_seconds (float): Target length in seconds.
+        device (torch.device): Device to load the tensor onto.
+
+    Returns:
+        torch.Tensor or None: Waveform tensor (1, 1, T) on the specified device,
+                              or None if loading/processing fails.
+    """
+    try:
+        max_samples = int(target_sr * max_clip_len_seconds)
+        # Load audio file
+        waveform, sr = torchaudio.load(str(file_path), normalize=True)
+
+        # Resample if necessary
+        if sr != target_sr:
+            # Use torchaudio's resample transform
+            resampler = T.Resample(sr, target_sr, dtype=waveform.dtype)
+            waveform = resampler(waveform)
+
+        # Convert to mono by averaging channels if necessary
+        if waveform.shape[0] > 1:
+            waveform = torch.mean(waveform, dim=0, keepdim=True)
+
+        # Ensure it's at least 2D (channel, time)
+        if waveform.dim() == 1:
+             waveform = waveform.unsqueeze(0) # Add channel dim
+
+        # Trim or pad to max_samples
+        current_len = waveform.shape[1]
+        if current_len > max_samples:
+            # Trim from the beginning (consistent with AudioTextDataset?)
+            # Make sure this matches how your dataset trims, adjust if needed
+            offset = random.randint(0, current_len - max_samples)
+            waveform = waveform[:, offset:offset+max_samples]
+            # waveform = waveform[:, :max_samples] # Simpler trim from start
+        elif current_len < max_samples:
+            # Pad with zeros
+            padding = max_samples - current_len
+            waveform = torch.nn.functional.pad(waveform, (0, padding))
+
+        # Add batch dimension and move to device
+        waveform = waveform.unsqueeze(0).to(device) # Shape: (1, 1, T)
+
+        return waveform
+
+    except FileNotFoundError:
+        print(f"Error: Audio file not found at {file_path}")
+        return None
+    except Exception as e:
+        print(f"Error loading/processing single file {file_path}: {e}")
+        return None
 
 def save_batch_precomputed_data(output_dir, batch_index, batch_data_list):
     """
@@ -285,7 +345,7 @@ def process_files_for_recipes(data_files, target_recipe_file, configs):
         dataset,
         batch_size=effective_batch_size,
         shuffle=False, # Must be False for recipes to match Phase 2 order
-        num_workers=num_workers,
+        num_workers=num_workers, # Use variable read from config
         collate_fn=safe_collate # Use the safe collate function
     )
 
@@ -398,7 +458,8 @@ def process_files_for_stfts(data_files, target_output_dir, recipe_file, configs,
         raise
 
     sampling_rate = configs['data']['sampling_rate']
-    max_clip_len = configs['data']['segment_seconds']
+    max_clip_len = configs['data']['segment_seconds'] # Read segment length in seconds
+    max_samples = int(sampling_rate * max_clip_len) # Calculate max_samples
     lower_db = configs['data']['loudness_norm']['lower_db']
     higher_db = configs['data']['loudness_norm']['higher_db']
     batch_size = configs['train']['batch_size_per_device']
@@ -429,7 +490,7 @@ def process_files_for_stfts(data_files, target_output_dir, recipe_file, configs,
         dataset,
         batch_size=effective_batch_size,
         shuffle=False,
-        num_workers=num_workers,
+        num_workers=num_workers, # Use variable read from config
         collate_fn=safe_collate, # Use the safe collate function
         pin_memory=True
     )
@@ -489,60 +550,92 @@ def process_files_for_stfts(data_files, target_output_dir, recipe_file, configs,
         num_noise_components_added = torch.zeros(num_valid_items, device=device)
 
         # Create a lookup map for paths -> index in the current *valid* batch (items with recipes)
-        # We use original_audiopaths[valid_indices_in_batch] to get the paths corresponding to valid_waveforms
         current_valid_batch_paths = [original_audiopaths[i] for i in valid_indices_in_batch]
         current_valid_batch_path_to_idx_map = {path: k for k, path in enumerate(current_valid_batch_paths)}
 
+        # We need the current device for loading individual files if necessary
+        current_device = primary_segments.device
+
         for k, recipe in enumerate(batch_recipes_used): # k iterates from 0 to num_valid_items-1
-            primary_seg_for_norm = primary_segments[k] # Reference waveform for item k
+            primary_seg_for_norm = primary_segments[k:k+1] # Keep dims (1, 1, T) for reference
             primary_path = recipe['original_audiopath'] # Path of the primary item for this recipe
 
-            # Get component paths from the recipe
             component_paths_in_recipe = recipe.get('component_original_paths', [])
             if not component_paths_in_recipe:
                 print(f"Warning: Recipe for '{primary_path}' is missing 'component_original_paths'. Cannot create mixture.")
                 continue # Skip mixing for this item
 
-            item_noise = torch.zeros_like(primary_seg_for_norm)
+            item_noise = torch.zeros_like(primary_seg_for_norm) # Shape (1, 1, T)
 
             for comp_path in component_paths_in_recipe:
                  if comp_path == primary_path:
                      continue # Skip the primary segment itself
 
-                 # Try to find this component path in the *current* valid batch map
+                 next_segment = None # Initialize next_segment
+
+                 # 1. Try to find component in the current batch
                  comp_idx_in_current_valid_batch = current_valid_batch_path_to_idx_map.get(comp_path)
 
                  if comp_idx_in_current_valid_batch is not None:
                      # Component is present in the current batch, use its waveform
-                     # Use the index k found from the map, which corresponds to the index in primary_segments/valid_waveforms
-                     next_segment = primary_segments[comp_idx_in_current_valid_batch]
-
-                     # Apply loudness normalization relative to the primary segment of the *current item k*
-                     rescaled_next_segment = mixer_dynamic_loudnorm(
-                         audio=next_segment, reference=primary_seg_for_norm, **loudness_params
-                     )
-                     item_noise += rescaled_next_segment
-                     num_noise_components_added[k] += 1
+                     next_segment = primary_segments[comp_idx_in_current_valid_batch:comp_idx_in_current_valid_batch+1] # Keep dims (1, 1, T)
                  else:
-                      # Component required by recipe is not present in the current valid batch
-                      # (Maybe it failed loading *this time*, or wasn't in this batch by chance,
-                      # or failed recipe generation and thus isn't in recipes_dict)
-                      # Check if it exists in the original batch but just didnt have a recipe
-                      original_batch_indices_for_path = [orig_idx for orig_idx, p in enumerate(original_audiopaths) if p == comp_path]
-                      if original_batch_indices_for_path:
-                           # It was loaded in this batch, but didn't have a valid recipe itself (was filtered out earlier)
-                           print(f"Warning: Component path '{comp_path}' (required by recipe for '{primary_path}') was loaded in batch {batch_idx} but had no recipe. Skipping component.")
+                      # 2. Component not in batch, attempt to load it individually
+                      # print(f"Debug: Component '{comp_path}' for recipe '{primary_path}' not in batch {batch_idx}. Attempting individual load.") # Optional debug
+                      loaded_segment = load_single_waveform(
+                          file_path=comp_path,
+                          target_sr=sampling_rate,
+                          max_clip_len_seconds=max_clip_len, # Pass seconds
+                          device=current_device # Load directly to the processing device
+                      )
+                      if loaded_segment is not None:
+                          # Ensure loaded segment has the same time dimension as primary_seg_for_norm
+                          # This should be handled by load_single_waveform's padding/trimming
+                          if loaded_segment.shape[-1] != primary_seg_for_norm.shape[-1]:
+                               print(f"Warning: Loaded segment {comp_path} time dim {loaded_segment.shape[-1]} "
+                                     f"doesn't match primary {primary_path} time dim {primary_seg_for_norm.shape[-1]} "
+                                     f"after loading. Check padding/trimming logic. Skipping component.")
+                               continue # Skip if length mismatch persists
+                          next_segment = loaded_segment
                       else:
-                           # It genuinely wasn't loaded in this batch (failed audio load or just not included)
-                           print(f"Warning: Component path '{comp_path}' (required by recipe for '{primary_path}') not found or not loaded in current batch {batch_idx}. Skipping component.")
+                          # Loading failed, print handled by load_single_waveform
+                          print(f"Warning: Failed to load component '{comp_path}' for recipe '{primary_path}'. Skipping component.")
+                          continue # Skip this component if loading failed
+
+                 # 3. If we have the segment (from batch or loaded), process and add it
+                 if next_segment is not None:
+                     # Apply loudness normalization relative to the primary segment of the *current item k*
+                     # Ensure reference has batch dim for mixer_dynamic_loudnorm if it expects (B, C, T)
+                     rescaled_next_segment = mixer_dynamic_loudnorm(
+                         audio=next_segment, # (1, 1, T)
+                         reference=primary_seg_for_norm, # (1, 1, T)
+                         **loudness_params
+                     )
+                     # Ensure shapes match before adding
+                     if rescaled_next_segment.shape == item_noise.shape:
+                         item_noise += rescaled_next_segment
+                         num_noise_components_added[k] += 1
+                     else:
+                          print(f"Warning: Shape mismatch after loudness norm for component {comp_path}. "
+                                f"ItemNoise: {item_noise.shape}, RescaledNext: {rescaled_next_segment.shape}. Skipping add.")
+
 
             # Normalize the combined noise for this item *if* components were added
             if num_noise_components_added[k] > 0:
+                 # Ensure item_noise has batch dim for mixer_dynamic_loudnorm if needed
                  item_noise = mixer_dynamic_loudnorm(
-                     audio=item_noise, reference=primary_seg_for_norm, **loudness_params
+                     audio=item_noise, # (1, 1, T)
+                     reference=primary_seg_for_norm, # (1, 1, T)
+                     **loudness_params
                  )
 
-            noise_accumulator[k] = item_noise # Store accumulated noise for item k
+            # Store accumulated noise for item k - ensure shape matches accumulator slice
+            if item_noise.shape == noise_accumulator[k:k+1].shape:
+                 noise_accumulator[k:k+1] = item_noise # Store accumulated noise for item k using slicing
+            else:
+                  print(f"Warning: Final item_noise shape {item_noise.shape} mismatch "
+                        f"with noise_accumulator slice {noise_accumulator[k:k+1].shape}. Skipping accumulation.")
+
 
         # 4. Create Mixtures
         mixtures = primary_segments + noise_accumulator # Shape: (B_recipe_found, 1, T)
