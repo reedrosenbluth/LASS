@@ -539,17 +539,41 @@ class ResUNet30_Base(nn.Module, Base):
         
         # Apply masks and mixture phase (same as original feature_maps_to_wav)
         # Note: Using padded versions of input mag/phase
+
+        # --- Add extensive shape debugging --- #
+        print(f"\nDEBUG Shapes before recon:")
+        print(f"  sp_padded_time_freq: {sp_padded_time_freq.shape}")
+        print(f"  mask_mag:            {mask_mag.shape}")
+        print(f"  cos_in_padded:       {cos_in_padded.shape}")
+        print(f"  mask_cos:            {mask_cos.shape}")
+        print(f"  sin_in_padded:       {sin_in_padded.shape}")
+        print(f"  mask_sin:            {mask_sin.shape}")
+        # --- End debugging ---
+
         out_cos = (cos_in_padded * mask_cos - sin_in_padded * mask_sin)
         out_sin = (sin_in_padded * mask_cos + cos_in_padded * mask_sin)
         out_mag = F.relu_(sp_padded_time_freq * mask_mag) 
 
+        # --- Debug shapes after first step --- #
+        print(f"DEBUG Shapes after recon step 1:")
+        print(f"  out_cos: {out_cos.shape}")
+        print(f"  out_mag: {out_mag.shape}")
+        # --- End debugging ---
+
         out_real = out_mag * out_cos
         out_imag = out_mag * out_sin
+
+        # --- Debug shape after recon step 2 (before F padding) --- #
+        print(f"DEBUG out_real shape before F padding: {out_real.shape}")
+        # --- End debugging ---
 
         # Pad frequency dimension back if it was reduced
         if origin_freq_bins % 2 != 0:
             out_real = F.pad(out_real, pad=(0, 1))
             out_imag = F.pad(out_imag, pad=(0, 1))
+
+        # --- DEBUG: Check shape before reshape --- #
+        print(f"DEBUG: out_real shape before reshape: {out_real.shape}")
 
         # ISTFT requires shape (N, 1, T, F)
         shape = (batch_size * self.target_sources_num * self.output_channels, 1, time_steps_padded, origin_freq_bins)
