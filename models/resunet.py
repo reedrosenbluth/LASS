@@ -452,19 +452,14 @@ class ResUNet30_Base(nn.Module, Base):
         # Input is STFT magnitude
         x = stft_magnitude # (batch_size, input_channels=1, time_steps, freq_bins)
 
-        # --- Squeeze potential extra dim from collation ---
-        # Collated precomputed STFTs might be (B, 1, C, T, F) instead of (B, C, T, F)
         if x.dim() == 5 and x.shape[1] == 1:
             x = x.squeeze(1) # Squeeze the second dimension -> (B, C, T, F)
-            # Also squeeze phase inputs if they are 5D
             if cos_in.dim() == 5 and cos_in.shape[1] == 1:
                 cos_in = cos_in.squeeze(1)
             if sin_in.dim() == 5 and sin_in.shape[1] == 1:
                 sin_in = sin_in.squeeze(1)
 
-        # Now x, cos_in, sin_in should be 4D: (B, C, T, F)
-
-        sp = x # Keep original magnitude AFTER potential squeeze for mask application
+        sp = x
 
         # Batch normalization
         if x.shape[1] == 1:
@@ -482,21 +477,18 @@ class ResUNet30_Base(nn.Module, Base):
         )
         x = F.pad(x, pad=(0, 0, 0, pad_len)) # Pad T axis
         sp_padded_time = F.pad(sp, pad=(0, 0, 0, pad_len)) # Also pad original mag for masking
-        # --- Pad input phase in time as well --- #
         cos_in_padded_time = F.pad(cos_in, pad=(0, 0, 0, pad_len))
         sin_in_padded_time = F.pad(sin_in, pad=(0, 0, 0, pad_len))
 
         # Pad frequency axis if needed
         origin_freq_bins = x.shape[-1]
         if origin_freq_bins % 2 != 0:
-            x = x[..., 0 : origin_freq_bins - 1] # (bs, channels, T_pad, F_even)
+            x = x[..., 0 : origin_freq_bins - 1]
             sp_padded_time_freq = sp_padded_time[..., 0 : origin_freq_bins - 1]
-            # Use time-padded versions for phase
             cos_in_padded = cos_in_padded_time[..., 0 : origin_freq_bins - 1]
             sin_in_padded = sin_in_padded_time[..., 0 : origin_freq_bins - 1]
         else:
             sp_padded_time_freq = sp_padded_time
-            # Use time-padded versions for phase
             cos_in_padded = cos_in_padded_time
             sin_in_padded = sin_in_padded_time
 
@@ -516,12 +508,10 @@ class ResUNet30_Base(nn.Module, Base):
         x11 = self.decoder_block5(x10, x2, film_dict['decoder_block5'])
         x12 = self.decoder_block6(x11, x1, film_dict['decoder_block6'])
 
-        x = self.after_conv(x12) # (bs, output_channels * K, T_pad, F_even)
+        x = self.after_conv(x12)
 
-        # --- Reconstruct complex STFT using mixture phase --- # 
         batch_size, _, time_steps_padded, freq_bins_padded = x.shape
 
-        # Reshape output to separate K components
         x = x.reshape(
             batch_size,
             self.target_sources_num, # Should be 1
@@ -659,16 +649,12 @@ class ResUNet30(nn.Module):
             cos_in=stft_mixture_cos,
             sin_in=stft_mixture_sin,
             film_dict=film_dict,
-            target_length=target_length, # Pass target length
+            target_length=target_length,
         )
 
         return output_dict
 
     def chunk_inference(self, input_dict):
-        # TODO: Chunk inference needs significant rewrite to handle STFT inputs/outputs
-        # Needs to take STFT mag/phase chunks, run base, combine waveform chunks.
-        # Temporarily comment out or raise NotImplementedError
         raise NotImplementedError("Chunk inference not updated for STFT input / waveform output yet.")
-        # ... (original chunk_inference code commented out) ...
 
 
